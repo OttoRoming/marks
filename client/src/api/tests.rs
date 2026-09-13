@@ -1,3 +1,5 @@
+//! The tests for `api`, against a server the test serves itself.
+
 use super::*;
 use crate::test_page::{serve_answer, serve_answers};
 use std::time::Duration;

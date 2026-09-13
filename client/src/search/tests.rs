@@ -1,3 +1,5 @@
+//! The tests for `search`: what a query finds, and which characters it found it in.
+
 use super::*;
 
 /// What `query` matched in `text`, written out as the characters themselves.

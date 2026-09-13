@@ -1,3 +1,5 @@
+//! The tests for `title`, against pages served from this machine: none of them needs the internet.
+
 use super::*;
 use crate::test_page::{serve, serve_answer};
 use std::time::Duration;

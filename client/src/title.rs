@@ -1,3 +1,15 @@
+//! The title of the page a mark points at.
+//!
+//! Typing a link and pressing Ctrl+Enter names the mark after the page rather than after the
+//! address ([`fetch_title`]), which is what a name is for: "Example Domain" says more than
+//! "example.com". A page that cannot be reached, that answers with something other than HTML, or
+//! that names no title is no trouble at all — the mark is saved under the name it would have had
+//! anyway, so none of this can lose a bookmark.
+//!
+//! The document is scanned rather than parsed: a title is one element, and the two ways a plain
+//! search for it goes wrong — the tag named inside a comment, or inside a script — are stepped
+//! over by hand rather than by a dependency.
+
 use std::io::Read;
 use std::time::Duration;
 

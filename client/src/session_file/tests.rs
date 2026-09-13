@@ -1,3 +1,6 @@
+//! The tests for `session_file`, in directories of their own rather than the one this machine
+//! keeps a session in.
+
 use super::*;
 
 /// A directory to keep a session in, of this test's own, removed again when the test ends.

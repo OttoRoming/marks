@@ -26,7 +26,13 @@ pub(crate) struct Served {
 /// It answers a single request and then stops, which is all most of these tests need. A test
 /// that needs two hops (a redirect, say) starts two of these and points one at the other.
 pub(crate) fn serve_answer(head: &str, body: &str) -> Served {
-    serve_answers(vec![(head.to_owned(), body.to_owned())])
+    serve_bodies(vec![(head.to_owned(), body.as_bytes().to_vec())])
+}
+
+/// Serves `body` as bytes rather than as text, for the answers that are not text at all — a
+/// favicon, say, which has no business being a string and would be mangled by being made one.
+pub(crate) fn serve_bytes(head: &str, body: &[u8]) -> Served {
+    serve_bodies(vec![(head.to_owned(), body.to_vec())])
 }
 
 /// Serves one answer per request, in the order they are given, on a single port.
@@ -38,6 +44,16 @@ pub(crate) fn serve_answer(head: &str, body: &str) -> Served {
 /// Every answer is written on a connection of its own, so a client that keeps connections
 /// alive is not what these tests are measuring.
 pub(crate) fn serve_answers(answers: Vec<(String, String)>) -> Served {
+    serve_bodies(
+        answers
+            .into_iter()
+            .map(|(head, body)| (head, body.into_bytes()))
+            .collect(),
+    )
+}
+
+/// The work behind all of them: one answer per request, written as bytes.
+fn serve_bodies(answers: Vec<(String, Vec<u8>)>) -> Served {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -76,11 +92,12 @@ pub(crate) fn serve_answers(answers: Vec<(String, String)>) -> Served {
 
             let _ = requests.send(String::from_utf8_lossy(&sent).into_owned());
 
-            let response = format!(
-                "{head}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            let head = format!(
+                "{head}content-length: {}\r\nconnection: close\r\n\r\n",
                 body.len()
             );
-            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
             let _ = stream.flush();
         }
     });

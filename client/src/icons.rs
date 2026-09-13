@@ -1,4 +1,20 @@
+//! The favicons beside the marks.
+//!
+//! They are stored by the server, fetched one at a time from `/api/marks/<id>/icon`, decoded, and
+//! kept as textures so that a row is not downloaded and decoded again every frame.
+//! [`IconCache::icon`] never blocks — it answers with what it has and queues a download when it has
+//! nothing — and a small pool of worker threads does the downloading, which is why the list fills
+//! in rather than waiting.
+//!
+//! What was fetched is also kept on disk, under the cache directory (`icon_cache`), so that
+//! opening the window is not a round trip for every favicon on every run.
+//!
+//! A favicon that cannot be fetched or decoded is simply absent: the mark is still a mark, and
+//! nothing here is worth failing a request over.
+
 use std::collections::HashMap;
+#[cfg(test)]
+use std::fs;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -7,6 +23,7 @@ use eframe::egui;
 
 use crate::api::Api;
 use crate::app::Event;
+use crate::icon_cache::IconFiles;
 use crate::mark::Mark;
 
 /// How many favicons are downloaded at once.
@@ -39,17 +56,29 @@ pub struct IconCache {
     jobs: Sender<Job>,
 }
 
-/// One favicon to fetch. Only the id travels: the worker asks the server for the bytes, so the
-/// URL does not have to be reconstructed here.
+/// One favicon to fetch.
+///
+/// Both ids travel: the mark's, because that is what the server is asked for bytes by, and the
+/// icon's, because that is what those bytes are kept as on disk — one row of the server's `icon`
+/// table, shared by every mark on the same hostname.
 struct Job {
     mark_id: String,
+    icon_id: String,
 }
 
 impl IconCache {
     /// Starts the worker pool. The workers outlive every mark on screen and end with the app,
     /// when the job channel closes.
-    pub fn new(api: Arc<Api>, events: Sender<Event>, ctx: egui::Context) -> Self {
+    pub fn new(
+        api: Arc<Api>,
+        files: Option<IconFiles>,
+        events: Sender<Event>,
+        ctx: egui::Context,
+    ) -> Self {
         let (jobs, receiver) = mpsc::channel::<Job>();
+
+        // Shared by the workers, each of which writes only its own icon's file.
+        let files = Arc::new(files);
 
         // `Receiver` is not `Sync`, so the single queue lives behind a mutex that a worker
         // holds only while it takes the next job — never while it downloads.
@@ -58,12 +87,13 @@ impl IconCache {
         for index in 0..WORKERS {
             let receiver = Arc::clone(&receiver);
             let api = Arc::clone(&api);
+            let files = Arc::clone(&files);
             let events = events.clone();
             let ctx = ctx.clone();
 
             let worker = thread::Builder::new()
                 .name(format!("favicon-{index}"))
-                .spawn(move || work(receiver, api, events, ctx));
+                .spawn(move || work(receiver, api, files, events, ctx));
 
             // Without these threads the list has no icons at all, and that is worth being
             // loud about at startup rather than showing an empty slot forever.
@@ -88,6 +118,9 @@ impl IconCache {
             // A send failure means the pool is gone, which only happens on shutdown.
             let _ = self.jobs.send(Job {
                 mark_id: mark.id.clone(),
+                // Only ever asked for with an icon to ask about: the branch above is the one that
+                // handles a mark without one.
+                icon_id: mark.icon_id.clone().unwrap_or_default(),
             });
             IconState::Loading
         } else {
@@ -124,8 +157,43 @@ impl IconCache {
     }
 }
 
+/// The decoded favicon for one mark: from the disk if it is there, and from the server if not.
+///
+/// What comes back from the server is kept before it is handed over, so that the next run — and
+/// the next mark on the same hostname — costs a read rather than a request.
+fn image_for(api: &Api, files: Option<&IconFiles>, job: &Job) -> Option<egui::ColorImage> {
+    if let Some(stored) = files.and_then(|files| files.read(&job.icon_id)) {
+        if let Some(image) = decode(&stored) {
+            return Some(image);
+        }
+
+        // Kept, and not something that can be drawn: no use to anyone, and in the way of the copy
+        // that can be fetched in its place.
+        if let Some(files) = files {
+            files.forget(&job.icon_id);
+        }
+    }
+
+    let bytes = api.fetch_icon(&job.mark_id).ok()?;
+    let image = decode(&bytes)?;
+
+    // Kept only once it is known to be drawable: a request that answered with something useless
+    // is not worth remembering.
+    if let Some(files) = files {
+        files.write(&job.icon_id, &bytes);
+    }
+
+    Some(image)
+}
+
 /// Takes jobs until the queue closes, fetching and decoding one favicon at a time.
-fn work(receiver: Arc<Mutex<Receiver<Job>>>, api: Arc<Api>, events: Sender<Event>, ctx: egui::Context) {
+fn work(
+    receiver: Arc<Mutex<Receiver<Job>>>,
+    api: Arc<Api>,
+    files: Arc<Option<IconFiles>>,
+    events: Sender<Event>,
+    ctx: egui::Context,
+) {
     loop {
         let job = {
             // Held only for the `recv` below: whoever waits here is waiting for work, not for
@@ -140,10 +208,7 @@ fn work(receiver: Arc<Mutex<Receiver<Job>>>, api: Arc<Api>, events: Sender<Event
         };
 
         // A favicon that cannot be fetched or decoded is simply absent; the mark stays usable.
-        let image = api
-            .fetch_icon(&job.mark_id)
-            .ok()
-            .and_then(|bytes| decode(&bytes));
+        let image = image_for(&api, files.as_ref().as_ref(), &job);
 
         if events
             .send(Event::Icon {
@@ -175,3 +240,7 @@ fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
 
     Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
 }
+
+/// The tests, in a file of their own: `icons/tests.rs`, compiled only for test builds.
+#[cfg(test)]
+mod tests;

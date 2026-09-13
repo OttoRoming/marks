@@ -1,3 +1,5 @@
+//! The tests for `fonts`: the order the settings ask for, and the characters it can draw.
+
 use super::*;
 use ab_glyph::Font as _;
 
@@ -30,6 +32,96 @@ fn the_font_has(name: &str, c: char) -> bool {
     font.glyph_id(c).0 != 0
 }
 
+
+/// A machine, with two fonts on it, made of files that are to hand.
+///
+/// The real thing is read off whatever machine the test runs on — slow, and different everywhere —
+/// so a test builds one. The families are whatever those files call themselves, since that is
+/// where a family name lives, and they are chosen so as not to be names egui holds its own fonts
+/// under: the two kinds have to stay told apart.
+fn machine() -> SystemFonts {
+    let bundled = egui::FontDefinitions::default();
+
+    SystemFonts::from_data(vec![
+        bundled.font_data["NotoEmoji-Regular"].font.to_vec(),
+        egui_phosphor::Variant::Regular.font_data().font.to_vec(),
+    ])
+}
+
+#[test]
+fn a_machine_has_the_families_its_font_files_name() {
+    let machine = machine();
+    let families = machine.families();
+
+    assert_eq!(families.len(), 2, "{families:?}");
+    assert!(
+        families.iter().all(|name| !AVAILABLE.contains(&name.as_str())),
+        "the two kinds of font have to be distinguishable: {families:?}"
+    );
+
+    // Sorted, and each named once: a machine has several faces to a family, and the settings
+    // choose families.
+    let mut sorted = families.to_vec();
+    sorted.sort();
+    assert_eq!(families, sorted.as_slice());
+}
+
+#[test]
+fn a_font_on_the_machine_can_be_drawn_with() {
+    let machine = machine();
+    let wanted = machine.families()[0].clone();
+    let ctx = egui::Context::default();
+
+    install(&ctx, std::slice::from_ref(&wanted), Some(&machine));
+    draw_a_frame(&ctx);
+
+    assert_eq!(
+        drawn_order(&ctx, egui::FontFamily::Proportional),
+        [wanted.as_str()]
+    );
+
+    // And it is loaded, rather than merely named: a name in a family with no data behind it draws
+    // nothing at all.
+    let loaded = ctx.fonts(|fonts| fonts.definitions().font_data.clone());
+    assert!(loaded.contains_key(&wanted), "not loaded: {:?}", loaded.keys());
+}
+
+#[test]
+fn a_name_that_is_no_font_at_all_is_left_out_of_the_order() {
+    let machine = machine();
+    let wanted = machine.families()[0].clone();
+    let ctx = egui::Context::default();
+
+    install(
+        &ctx,
+        &["Comic Sans MS".to_owned(), wanted.clone()],
+        Some(&machine),
+    );
+    draw_a_frame(&ctx);
+
+    // Left out, rather than left in with nothing behind it: a family naming a font that is not
+    // there is a font that draws boxes.
+    assert_eq!(drawn_order(&ctx, egui::FontFamily::Proportional), [wanted]);
+}
+
+#[test]
+fn an_order_of_nothing_but_missing_fonts_falls_back_to_the_defaults() {
+    let ctx = egui::Context::default();
+
+    install(
+        &ctx,
+        &["Comic Sans MS".to_owned(), "Papyrus".to_owned()],
+        Some(&machine()),
+    );
+    draw_a_frame(&ctx);
+
+    // A window with no fonts in it is a window with no text in it.
+    assert_eq!(
+        drawn_order(&ctx, egui::FontFamily::Proportional),
+        default_priority()
+    );
+}
+
 #[test]
 fn every_font_the_default_order_names_is_one_egui_carries() {
     let bundled = egui::FontDefinitions::default();
@@ -48,7 +140,7 @@ fn every_font_the_default_order_names_is_one_egui_carries() {
 #[test]
 fn the_default_order_draws_with_hack() {
     let ctx = egui::Context::default();
-    install(&ctx, &default_priority());
+    install(&ctx, &default_priority(), None);
     draw_a_frame(&ctx);
 
     // First in the order means it is the font the text is drawn in, not a fallback for the
@@ -88,7 +180,7 @@ fn the_order_a_setting_gives_is_the_order_the_window_draws_in() {
         "Hack".to_owned(),
     ];
 
-    install(&ctx, &wanted);
+    install(&ctx, &wanted, None);
     draw_a_frame(&ctx);
 
     assert_eq!(drawn_order(&ctx, egui::FontFamily::Proportional), wanted);
@@ -101,7 +193,7 @@ fn an_order_with_nothing_in_it_falls_back_to_the_default() {
     // A family with no fonts in it is a window with no text in it, so an empty list is not
     // something to draw with: the default order is used instead.
     let ctx = egui::Context::default();
-    install(&ctx, &[]);
+    install(&ctx, &[], None);
     draw_a_frame(&ctx);
 
     assert_eq!(
@@ -109,3 +201,4 @@ fn an_order_with_nothing_in_it_falls_back_to_the_default() {
         default_priority()
     );
 }
+

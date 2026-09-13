@@ -1,3 +1,5 @@
+//! The tests for `config`: the settings file, and what becomes of one that is wrong.
+
 use super::*;
 
 /// A settings file of this test's own, removed again when the test ends.
@@ -146,6 +148,10 @@ fn a_fixed_window_cannot_be_resized_and_one_that_is_not_has_a_floor() {
 
     assert_eq!(viewport.resizable, Some(false));
     assert_eq!(viewport.inner_size, Some(egui::vec2(800.0, 600.0)));
+    // Pinned at both ends, not merely asked not to be resized: a window manager is free to
+    // ignore "not resizable", and a size that is its own minimum and maximum is obeyed.
+    assert_eq!(viewport.min_inner_size, Some(egui::vec2(800.0, 600.0)));
+    assert_eq!(viewport.max_inner_size, Some(egui::vec2(800.0, 600.0)));
 
     let free = Window {
         fixed_size: false,
@@ -155,8 +161,9 @@ fn a_fixed_window_cannot_be_resized_and_one_that_is_not_has_a_floor() {
 
     assert_eq!(viewport.resizable, Some(true));
     assert_eq!(viewport.inner_size, Some(egui::vec2(800.0, 600.0)));
-    // Free to be resized, but not below the size the list needs.
+    // Free to be resized, but not below the size the list needs, and with no ceiling at all.
     assert_eq!(viewport.min_inner_size, Some(floor()));
+    assert_eq!(viewport.max_inner_size, None);
 }
 
 #[test]
@@ -184,7 +191,7 @@ fn a_font_order_that_was_written_is_read_back() {
 }
 
 #[test]
-fn a_font_this_client_does_not_carry_is_dropped_from_the_order() {
+fn a_font_the_client_does_not_carry_is_left_in_the_order() {
     let file = Scratch::new("fonts-unknown");
     fs::create_dir_all(file.0.parent().expect("a parent")).expect("a directory");
     fs::write(
@@ -193,8 +200,14 @@ fn a_font_this_client_does_not_carry_is_dropped_from_the_order() {
     )
     .expect("a file written");
 
-    // A name that cannot be loaded is not left in the list doing nothing.
-    assert_eq!(file.config().fonts.priority, ["Hack", "Ubuntu-Light"]);
+    // It may be a font on this machine — nothing here can tell without reading every font the
+    // machine has, which is not something reading a settings file does — so it is left where it
+    // is. One that turns out to be no font at all is left out when the order is put onto the
+    // window, and the panel offers the fonts that are actually there.
+    assert_eq!(
+        file.config().fonts.priority,
+        ["Hack", "Comic Sans", "Ubuntu-Light"]
+    );
 }
 
 #[test]

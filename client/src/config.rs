@@ -77,9 +77,11 @@ pub struct Fonts {
     /// The fonts to draw with, most wanted first.
     ///
     /// The first one that has the character being drawn is the one that draws it, so the first
-    /// name here is the font nearly all of the window ends up in. Only the fonts the client
-    /// carries can be named — see [`fonts::AVAILABLE`]. The window is set out of the settings
-    /// in the panel behind Ctrl+, so this is not usually written by hand.
+    /// name here is the font nearly all of the window ends up in. A name is one of the fonts egui
+    /// carries ([`fonts::AVAILABLE`]) or a family this machine has; one that is neither is left
+    /// out of the order when the window is drawn, rather than drawn as boxes. The window is set out
+    /// of the settings in the panel behind Ctrl+, which searches every font the machine has, so
+    /// this is not usually written by hand.
     pub priority: Vec<String>,
 }
 
@@ -92,12 +94,17 @@ impl Default for Fonts {
 }
 
 impl Fonts {
-    /// Holds the list to fonts this client has, each named once, in an order it can draw in.
+    /// Holds the list to names worth drawing with: each named once, nothing empty, and never
+    /// nothing at all.
     ///
-    /// A name that is not one of the fonts the client carries is dropped: it could not be loaded
-    /// even if it were meant, and it is not worth leaving a name in the list that silently does
-    /// nothing. A list that leaves nothing at all becomes the default, because a family with no
-    /// fonts in it is a window with no text in it.
+    /// A name the client does not carry is left where it is rather than dropped, because it may
+    /// well be a font on this machine — which cannot be told apart from a name that is no font at
+    /// all without reading every font the machine has, and that is done on a worker thread some
+    /// while later (see `fonts::SystemFonts`). A name that turns out to be nothing is left out of
+    /// the order when it is put onto the window, and the panel shows it as it is.
+    ///
+    /// A list that leaves nothing at all becomes the default, because a family with no fonts in it
+    /// is a window with no text in it.
     ///
     /// Called as the file is read, and by the panel once it has changed the order.
     pub(crate) fn settle(&mut self) {
@@ -106,8 +113,7 @@ impl Fonts {
         for name in self.priority.drain(..) {
             let name = name.trim();
 
-            if !fonts::AVAILABLE.contains(&name) {
-                eprintln!("marks-client: \"{name}\" is not a font this client carries; ignored");
+            if name.is_empty() {
                 continue;
             }
             if kept.iter().any(|already| already == name) {
@@ -169,7 +175,11 @@ impl Window {
             .with_resizable(!self.fixed_size);
 
         if self.fixed_size {
+            // Held by both ends rather than by "not resizable" alone, which a window manager is
+            // free to ignore; this is the same pinning the panel applies (`apply_window_settings`).
             viewport
+                .with_min_inner_size(self.size())
+                .with_max_inner_size(self.size())
         } else {
             viewport.with_min_inner_size(floor())
         }

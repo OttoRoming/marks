@@ -1,3 +1,13 @@
+//! What a mark is, as it travels between the window and the server.
+//!
+//! [`Mark`] is the shape `/api/marks` returns (see `markSelection` on the server side), and there
+//! is nothing in it that the window cannot show: the favicon bytes are behind an endpoint of their
+//! own, and a password hash never leaves the server.
+//!
+//! [`web_link`] is the one piece of judgement here. A mark's content is either a link to open or a
+//! note to keep, and telling those apart is what decides whether it can be opened, whether it gets
+//! a favicon, and what it is called when its page has no title to give.
+
 use serde::Deserialize;
 
 /// One saved mark, exactly the fields `/api/marks` returns (see `markSelection` on the

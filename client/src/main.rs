@@ -6,6 +6,7 @@
 //!
 //! - [`api`] speaks to the server and is blocking, so it is only ever called off the UI thread,
 //! - [`icons`] downloads favicons on a pool of worker threads and caches them as textures,
+//! - [`icon_cache`] keeps those favicons on disk between runs, under the cache directory,
 //! - [`app`] is the window itself: state, keybindings and drawing,
 //! - [`mark`] is the shape a mark has on both sides of the wire,
 //! - [`title`] reads the title of the page a link points at, to name the mark after it,
@@ -19,6 +20,7 @@ mod api;
 mod app;
 mod config;
 mod fonts;
+mod icon_cache;
 mod icons;
 mod mark;
 mod search;

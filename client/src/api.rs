@@ -1,3 +1,15 @@
+//! Talking to a marks server.
+//!
+//! One client per server, holding the session token that makes its requests the signed-in user's
+//! ([`Api::with_token`], and `session_file` for where that token comes from). Every call is
+//! blocking, so it belongs on a worker thread: `MarksApp::spawn` is the only thing that makes one,
+//! and it is the reason the window never waits on the network.
+//!
+//! The server writes its failures as `{"error": "..."}` (see `parseJsonBody` on the server side),
+//! and that wording is passed through rather than replaced — the server knows why it said no. A
+//! 401 is the exception: it is read as [`ApiError::Unauthorized`], so that the window can put the
+//! sign-in dialog back up instead of showing the message.
+
 use std::fmt;
 use std::time::Duration;
 

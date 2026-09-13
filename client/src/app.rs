@@ -1,3 +1,15 @@
+//! The window: what the launcher is made of, and how it is driven.
+//!
+//! [`MarksApp`] holds everything on screen — the marks, the search box, the settings, the session
+//! — and draws it one frame at a time ([`MarksApp::show`]). Nothing here talks to the network: a
+//! request is handed to a worker thread (`MarksApp::spawn`) which reports what came back as an
+//! `Event`, and the frames after it act on that. A slow or unreachable server therefore costs a
+//! late answer rather than a frozen window.
+//!
+//! The keyboard is the interface, a launcher having one field and no buttons to hunt for:
+//! Ctrl+Enter saves what is typed, Enter opens the selected mark, Ctrl+D deletes it, Ctrl+, opens
+//! the settings panel, and Escape closes whatever is in front of the list.
+
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -6,7 +18,8 @@ use eframe::egui;
 
 use crate::api::{Api, ApiError};
 use crate::config::{self, Config, MAX_SIDE, MIN_HEIGHT, MIN_WIDTH};
-use crate::fonts;
+use crate::fonts::{self, SystemFonts};
+use crate::icon_cache::IconFiles;
 use crate::icons::{IconCache, IconState};
 use crate::mark::{Mark, web_link};
 use crate::search;
@@ -51,6 +64,8 @@ pub enum Event {
         mark_id: String,
         image: Option<egui::ColorImage>,
     },
+    /// The fonts this machine has, read on a worker thread because reading them is slow.
+    SystemFonts(Arc<SystemFonts>),
 }
 
 /// Which button a sign-in attempt came from.
@@ -126,15 +141,26 @@ pub struct MarksApp {
 
     /// The settings the window is running by, and where they are kept.
     config: Config,
+    /// The fonts this machine has, once they have been read.
+    system_fonts: Option<Arc<SystemFonts>>,
+    /// Whether that reading is under way, so that it is asked for once.
+    loading_fonts: bool,
+    /// What is typed in the panel's font search.
+    font_query: String,
     /// Whether the configuration panel is up.
     config_open: bool,
+    /// Whether the window's settings have been changed since the client was opened.
+    ///
+    /// The panel says nothing about a window manager ignoring a size until one has been asked
+    /// for: a line explaining a lack of change is worth reading after the change, and is only
+    /// noise before it. It stays said once it has been, for as long as the window is open.
+    window_settings_changed: bool,
 
     auth: AuthForm,
     notice: Option<Notice>,
 }
 
 impl MarksApp {
-    /// Builds the app for `ctx`, which the favicon pool needs a handle to.
     /// Builds the app for `ctx`, with the settings to run by, the server to talk to, and the
     /// session to start from handed in.
     ///
@@ -151,8 +177,10 @@ impl MarksApp {
         token: Option<String>,
         config: Config,
     ) -> Self {
-        // Before anything is drawn: the fonts are what everything after this is drawn with.
-        fonts::install(ctx, &config.fonts.priority);
+        // Before anything is drawn: the fonts are what everything after this is drawn with. The
+        // machine's own fonts are not read yet, so a setting naming one of those is honoured a
+        // moment later, when they arrive (see `ensure_system_fonts`).
+        fonts::install(ctx, &config.fonts.priority, None);
 
         // A session to start from means the window opens signed in, so closing it and opening
         // it again does not ask for the password a second time.
@@ -171,7 +199,11 @@ impl MarksApp {
             query: String::new(),
             selected: 0,
             config,
+            system_fonts: None,
+            loading_fonts: false,
+            font_query: String::new(),
             config_open: false,
+            window_settings_changed: false,
             // Without a session to start from, the first thing the app shows is the sign-in
             // dialog, with the caret already in the username field.
             auth: AuthForm {
@@ -181,9 +213,17 @@ impl MarksApp {
             notice: None,
         };
 
+        // A setting that names a font this machine has cannot be honoured until the machine's
+        // fonts have been read, which is slow enough to belong off this thread. Until then the
+        // window draws in the fonts egui carries.
+        if app.config.fonts.priority.iter().any(|name| !Self::bundled(name)) {
+            app.ensure_system_fonts(ctx);
+        }
+
         if let Some(api) = app.api.clone() {
             app.icons = Some(IconCache::new(
                 Arc::clone(&api),
+                IconFiles::for_server(&app.base_url),
                 app.events_tx.clone(),
                 ctx.clone(),
             ));
@@ -201,6 +241,7 @@ impl MarksApp {
                     // The favicon pool needs the cookie, so it starts with the session.
                     self.icons = Some(IconCache::new(
                         Arc::clone(&api),
+                        IconFiles::for_server(&self.base_url),
                         self.events_tx.clone(),
                         ctx.clone(),
                     ));
@@ -252,6 +293,12 @@ impl MarksApp {
                     self.clamp_selection();
                 }
                 Event::DeleteFailed(message) => self.notice = Some(Notice::error(message)),
+                Event::SystemFonts(fonts) => {
+                    self.loading_fonts = false;
+                    self.system_fonts = Some(fonts);
+                    // The settings may name a font that could not be loaded until now.
+                    self.install_fonts(ctx);
+                }
                 Event::Icon { mark_id, image } => {
                     if let Some(icons) = &mut self.icons {
                         // Uploading the texture is the one part of the download that has to
@@ -689,21 +736,28 @@ impl MarksApp {
 
         ui.horizontal_wrapped(|ui| {
             if self.api.is_none() {
-                ui.weak("Esc  close");
+                // The sign-in dialog has the keyboard, so Esc is the only key worth naming.
+                ui.weak(hints(&["Esc close"]));
                 return;
             }
 
             if let Some(hint) = self.save_hint() {
                 ui.strong(hint);
-                ui.separator();
+                ui.weak(HINT_SEPARATOR);
             }
 
             if let Some(username) = &self.username {
                 ui.weak(format!("signed in as {username}"));
-                ui.separator();
+                ui.weak(HINT_SEPARATOR);
             }
 
-            ui.weak("↑↓ move   Enter open   Ctrl+D delete   Ctrl+, settings   Esc close");
+            ui.weak(hints(&[
+                "↑↓ move",
+                "Enter open",
+                "Ctrl+D delete",
+                "Ctrl+, settings",
+                "Esc close",
+            ]));
         });
     }
 
@@ -712,7 +766,10 @@ impl MarksApp {
     /// Everything it changes takes effect at once, on the window that is open, so that a size
     /// or a font can be tried rather than imagined; what the panel settles on is written to the
     /// settings file as it is settled.
-    fn config_panel(&mut self, ctx: &egui::Context) {
+    fn config_panel(&mut self, ctx: &egui::Context, window: egui::Rect) {
+        // The panel is where fonts are chosen, so this is where the machine's are asked for.
+        self.ensure_system_fonts(ctx);
+
         // Gathered while the panel is drawn and acted on after it, because the panel is reading
         // from `self` while these would be changing it.
         let mut fixed_size = None;
@@ -720,11 +777,22 @@ impl MarksApp {
         let mut apply = false;
         // ...and the file is written once the edit is over, rather than once per frame of a drag.
         let mut keep = false;
-        // A font moving up or down the list, worked out as the list is drawn.
+        // A font moving up or down the list, taken out of it, or put back into it, worked out as
+        // the list is drawn.
         let mut moved = None;
+        let mut removed = None;
+        let mut added = None;
+
+        // What is left of the window once the panel's own margins are taken out of it. A window
+        // can be set smaller than the panel is tall — the smallest it may be is — and without
+        // somewhere to scroll, the top of the panel is drawn above the window and cannot be
+        // reached at all.
+        let room = (window.height() - 80.0).max(100.0);
 
         egui::Modal::new(egui::Id::new("configuration")).show(ctx, |ui| {
             ui.set_width(380.0);
+
+            egui::ScrollArea::vertical().max_height(room).show(ui, |ui| {
             ui.heading("Configuration");
             ui.add_space(10.0);
 
@@ -764,15 +832,24 @@ impl MarksApp {
             } else {
                 "The window opens at this size, and can be resized after."
             });
+            // Only once a size has been asked for: a window manager has the last word on a
+            // window's size, and a tiling one has the only word, so this is asked for rather
+            // than imposed — which is worth saying after a change, and is noise before one.
+            if self.window_settings_changed {
+                ui.label(restart_note(ui));
+            }
 
             ui.add_space(12.0);
             ui.strong("Fonts");
             ui.add_space(4.0);
             ui.weak("The first font that has a character is the one that draws it.");
 
-            // A copy, because the list is being read while a move is being decided on.
+            // A copy, because the list is being read while a move, an addition or a removal is
+            // being decided on.
             let priority = self.config.fonts.priority.clone();
             let last = priority.len().saturating_sub(1);
+            // The last font cannot be taken out: the window has to be drawn in something.
+            let removable = priority.len() > 1;
 
             for (index, name) in priority.iter().enumerate() {
                 ui.horizontal(|ui| {
@@ -782,17 +859,26 @@ impl MarksApp {
                         ui.label(name);
                     }
 
-                    // Buttons right-aligned, with the pair of them the same width whether or
-                    // not one is disabled.
+                    // Buttons right-aligned, and every row the same width whether or not one of
+                    // them is disabled.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(index < last, egui::Button::new("Down"))
+                            .add_enabled(removable, icon_button(REMOVE_ICON))
+                            .on_hover_text("Draw without this font")
+                            .clicked()
+                        {
+                            removed = Some(index);
+                        }
+                        if ui
+                            .add_enabled(index < last, icon_button(LATER_ICON))
+                            .on_hover_text("Draw with this font after the ones above it")
                             .clicked()
                         {
                             moved = Some((index, 1));
                         }
                         if ui
-                            .add_enabled(index > 0, egui::Button::new("Up"))
+                            .add_enabled(index > 0, icon_button(SOONER_ICON))
+                            .on_hover_text("Draw with this font before the ones below it")
                             .clicked()
                         {
                             moved = Some((index, -1));
@@ -801,6 +887,93 @@ impl MarksApp {
                 });
             }
 
+            // Adding one: egui's own select, with the field that searches it at the top of the
+            // dropdown.
+            //
+            // The button, its arrow, the frame, the scrolling, the closing on a press anywhere else
+            // and the keyboard are all egui's. A dropdown of the panel's own — which this was — has
+            // to get the focus, the frame and the order of a press and its release right in every
+            // case, and that is what a widget is for.
+            //
+            // A select has no way to search what it offers, and a machine can have a thousand
+            // families, so the field goes inside the dropdown: that is what a searchable select in
+            // egui is made of, and it is also why the dropdown is asked to stay up while its own
+            // field and its own rows are pressed — a press inside would otherwise be the press that
+            // closed it.
+            ui.add_space(6.0);
+
+            // Egui's own menu colour is the colour of the dialog this panel is drawn on, and a
+            // dropdown the same colour as what is behind it does not read as a list of things to
+            // choose from. It is set into the panel in the colour the panel sets its own fields
+            // into, which follows the theme rather than being mixed here.
+            let inset = ui.visuals().extreme_bg_color;
+            let button = ui.make_persistent_id(egui::IdSalt::new(ADD_FONT));
+
+            // Read before the dropdown is drawn, so that on the frame it opens this is still last
+            // frame's answer: that is how "it has just opened" is told from "it is open", and so
+            // how the search field takes the keyboard once rather than on every frame.
+            let was_open = egui::ComboBox::is_open(ctx, button);
+
+            egui::ComboBox::from_id_salt(ADD_FONT)
+                .selected_text("Add a font")
+                .width(ui.available_width())
+                // Not the default: egui's default closes a menu on any press, and the presses
+                // inside this one are how the search is typed at and how a font is picked.
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                // `.into()` because `popup_style` asks for a `StyleModifier`, which egui does not
+                // name at its root.
+                .popup_style((move |style: &mut egui::Style| style.visuals.window_fill = inset).into())
+                .show_ui(ui, |ui| {
+                    // The dropdown is one colour, so the field is its first row rather than a box
+                    // set into it; what says it is a field is the caret in it.
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut self.font_query)
+                            .hint_text("Search the fonts on this machine")
+                            .desired_width(f32::INFINITY)
+                            .background_color(inset),
+                    );
+
+                    // Asked for again whenever nothing at all has the keyboard, which is what a
+                    // press on one of the rows below leaves behind: the dropdown stays up after a
+                    // font is added, and without this the next name would have to be clicked for.
+                    if !was_open || ui.memory(|memory| memory.focused().is_none()) {
+                        search.request_focus();
+                    }
+
+                    ui.add_space(4.0);
+
+                    match &self.system_fonts {
+                        None => {
+                            ui.weak("Looking for the fonts on this machine...");
+                        }
+                        Some(system) => {
+                            let (shown, answered) = fonts_to_add(&self.font_query, system, &priority);
+
+                            if shown.is_empty() {
+                                ui.weak("Nothing by that name is left to add.");
+                            }
+
+                            // Scrolled inside the dropdown rather than by it: the search field stays
+                            // where it is while the list under it moves, and a dropdown tall enough
+                            // to hold every font a machine has is taller than the window.
+                            egui::ScrollArea::vertical().max_height(LIST_HEIGHT).show(ui, |ui| {
+                                for name in &shown {
+                                    if ui.selectable_label(false, name).clicked() {
+                                        added = Some(name.clone());
+                                    }
+                                }
+                            });
+
+                            if answered > shown.len() {
+                                ui.weak(format!(
+                                    "and {} more: type more of the name",
+                                    answered - shown.len()
+                                ));
+                            }
+                        }
+                    }
+                });
+
             ui.add_space(12.0);
             ui.weak(match self.config.path() {
                 Some(path) => format!("Settings are kept in {}", path.display()),
@@ -808,11 +981,16 @@ impl MarksApp {
             });
             ui.add_space(4.0);
             ui.weak("Ctrl+, or Esc closes this panel");
+            });
         });
 
         // One decision, applied and written in the same breath; then the size, which is applied
         // as it moves and written when it settles.
-        if let Some((index, delta)) = moved {
+        if let Some(name) = added {
+            self.add_font(ctx, &name);
+        } else if let Some(index) = removed {
+            self.remove_font(ctx, index);
+        } else if let Some((index, delta)) = moved {
             self.move_font(ctx, index, delta);
         } else if let Some(fixed) = fixed_size {
             self.set_fixed_size(ctx, fixed);
@@ -840,11 +1018,87 @@ impl MarksApp {
         self.settle_fonts(ctx);
     }
 
+    /// Takes the font at `index` out of the order, and writes the new one down.
+    ///
+    /// A font that is not in the order is not drawn with at all, and the window falls through to
+    /// the ones after it. The last one cannot go — a font order with nothing in it is a window
+    /// with no text in it — which the panel's button says by being disabled.
+    fn remove_font(&mut self, ctx: &egui::Context, index: usize) {
+        // Nothing left to draw with, or nothing at that place in the list.
+        if self.config.fonts.priority.len() <= 1 || index >= self.config.fonts.priority.len() {
+            return;
+        }
+
+        self.config.fonts.priority.remove(index);
+
+        self.settle_fonts(ctx);
+    }
+
+    /// Puts `name` at the end of the order, and writes the new one down.
+    ///
+    /// Last rather than first: a font that has just been added is one more to fall back to, and
+    /// the ones already in the order are the ones the window is drawn in. Moving it up is the
+    /// next thing the panel offers.
+    fn add_font(&mut self, ctx: &egui::Context, name: &str) {
+        let held = self.config.fonts.priority.iter().any(|font| font == name);
+
+        // One of the fonts egui carries, or a family this machine has: the two kinds of name that
+        // something can be found behind. A name that is neither is refused, because
+        // [`crate::fonts::install`] leaves it out of the order anyway — a font that is silently
+        // passed over every time the window is drawn is worse than one that was never added.
+        //
+        // The machine's families are the ones that matter here. The panel's dropdown offers every
+        // one of them, and since the order starts out naming all four of egui's fonts, every row it
+        // can offer is one of the machine's — so refusing those made a press on any row do nothing
+        // at all, under a dropdown that had just offered it.
+        let known = fonts::AVAILABLE.contains(&name)
+            || self
+                .system_fonts
+                .as_ref()
+                .is_some_and(|system| system.families().iter().any(|family| family == name));
+
+        if held || !known {
+            return;
+        }
+
+        self.config.fonts.priority.push(name.to_owned());
+
+        self.settle_fonts(ctx);
+    }
+
     /// Puts the fonts onto the window that is open, and the order on disk.
     fn settle_fonts(&mut self, ctx: &egui::Context) {
         self.config.fonts.settle();
-        fonts::install(ctx, &self.config.fonts.priority);
+        self.install_fonts(ctx);
         self.config.save();
+    }
+
+    /// Puts the order the settings hold onto the window.
+    ///
+    /// Separate from `settle_fonts` because it is also what happens when the machine's fonts
+    /// arrive: the order has not changed then, but the fonts that can satisfy it have.
+    fn install_fonts(&self, ctx: &egui::Context) {
+        fonts::install(ctx, &self.config.fonts.priority, self.system_fonts.as_deref());
+    }
+
+    /// Asks for the fonts on this machine, if they have not been read yet.
+    ///
+    /// On a worker thread, like every other request this window makes: a machine can have
+    /// thousands of fonts and reading their names takes long enough to be seen. The order is put
+    /// onto the window again when they arrive, since a font the settings named may only now be
+    /// loadable.
+    fn ensure_system_fonts(&mut self, ctx: &egui::Context) {
+        if self.system_fonts.is_some() || self.loading_fonts {
+            return;
+        }
+
+        self.loading_fonts = true;
+        self.spawn(ctx, || Event::SystemFonts(Arc::new(SystemFonts::load())));
+    }
+
+    /// Whether `name` is one of the fonts egui carries, and so needs nothing read to use.
+    fn bundled(name: &str) -> bool {
+        fonts::AVAILABLE.contains(&name)
     }
 
     /// Keeps the window at one size, or frees it again, and writes the choice down.
@@ -861,6 +1115,9 @@ impl MarksApp {
         self.config.window.clamp();
         self.apply_window_settings(ctx);
         self.config.save();
+
+        // A size has been asked for, so the panel can now say what to do if it does not arrive.
+        self.window_settings_changed = true;
     }
 
     /// Puts the settings onto the window that is already open.
@@ -869,18 +1126,28 @@ impl MarksApp {
     /// because a window that is up is told what to be rather than rebuilt.
     fn apply_window_settings(&self, ctx: &egui::Context) {
         let window = &self.config.window;
+        let size = window.size();
 
+        // The order of these is not arbitrary. A window is made unresizable by *pinning* it: on
+        // X11 `set_resizable(false)` writes whatever size the window is at that moment as both
+        // the smallest it may be and the largest, so asking for it first pins the window to the
+        // size it is about to leave and the new size never arrives. Constraints and size first,
+        // and the pinning last.
+        if window.fixed_size {
+            // Held at exactly one size, by both ends of it rather than by the hint alone: a
+            // window manager is free to ignore "not resizable", and none of them ignores a
+            // smallest size equal to the largest.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        } else {
+            // No largest size — which is what `INFINITY` says to egui — and the floor the list
+            // needs to be drawn in.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::Vec2::INFINITY));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(config::floor()));
+        }
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!window.fixed_size));
-        // A window held at one size is held at exactly that; one that can be resized is held to
-        // the floor the list needs.
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
-            if window.fixed_size {
-                window.size()
-            } else {
-                config::floor()
-            },
-        ));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window.size()));
     }
 
     /// Draws one frame of the window.
@@ -924,7 +1191,7 @@ impl MarksApp {
                 self.authenticate(&ctx, mode);
             }
         } else if self.config_open {
-            self.config_panel(&ctx);
+            self.config_panel(&ctx, ui.max_rect());
         }
     }
 }
@@ -1184,6 +1451,126 @@ fn named_after_title(content: &str, fallback: String) -> String {
         Some(title) => title.chars().take(MAX_NAME_CHARS).collect(),
         None => fallback,
     }
+}
+
+/// What the panel's buttons are drawn as: one font moving up the order, one moving down, and one
+/// leaving it.
+///
+/// Icons rather than words, and from the client's own icon font rather than from the fonts the
+/// settings choose — which is what [`fonts::ICON_FAMILY`] is for, and why these cannot be drawn
+/// as a box by a font order that has been rearranged.
+const SOONER_ICON: &str = egui_phosphor::regular::CARET_UP;
+const LATER_ICON: &str = egui_phosphor::regular::CARET_DOWN;
+const REMOVE_ICON: &str = egui_phosphor::regular::X;
+
+/// How large those are drawn: the size of the text they sit beside.
+const ICON_SIZE: f32 = 14.0;
+
+/// The font an icon is drawn in: the client's own, never one of the settings' fonts.
+///
+/// A free function so that the decision is in one place and can be asserted on: the button below
+/// is one line that uses it, and *that* is the thing worth checking.
+fn icon_font() -> egui::FontId {
+    egui::FontId::new(ICON_SIZE, egui::FontFamily::Name(fonts::ICON_FAMILY.into()))
+}
+
+/// A button whose label is one icon.
+fn icon_button(icon: &str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(icon.to_owned()).font(icon_font()))
+}
+
+/// The fonts the panel offers to add, best answer to the query first, and how many answered it.
+///
+/// Every family this machine has and every font egui carries, less the ones the order already
+/// names. The count is the whole of it rather than the part shown, so that the panel can say how
+/// many were left out.
+fn fonts_to_add(query: &str, system: &SystemFonts, priority: &[String]) -> (Vec<String>, usize) {
+    let mut found: Vec<(i64, String)> = fonts::AVAILABLE
+        .iter()
+        .map(|name| (*name).to_owned())
+        .chain(system.families().iter().cloned())
+        .filter(|name| !priority.iter().any(|held| held == name))
+        .filter_map(|name| search::find(&name, query).map(|found| (found.score, name)))
+        .collect();
+
+    // Best first, and the order they came in for anything scored the same — which is everything
+    // while the field is empty, so the list reads as egui's fonts and then the machine's, sorted.
+    found.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+
+    let answered = found.len();
+
+    (
+        found
+            .into_iter()
+            .take(ADD_LIMIT)
+            .map(|(_, name)| name)
+            .collect(),
+        answered,
+    )
+}
+
+/// What identifies the add control: the salt egui hashes into the dropdown's id.
+///
+/// Both halves of the picker need it — the widget, and `ComboBox::is_open`. `from_id_salt` hashes
+/// what it is given with `IdSalt::new`, so a call site that passed an `IdSalt` would hash it twice
+/// and never match the widget it is asking about.
+const ADD_FONT: &str = "add-font";
+
+/// How tall the list inside the dropdown is allowed to grow before it scrolls.
+///
+/// Under egui's own cap on a dropdown's height, so that the search field above it stays where it
+/// is: what scrolls is the list, not the dropdown it is set in.
+const LIST_HEIGHT: f32 = 140.0;
+
+/// How many fonts the panel lists at once: enough to choose from, few enough to draw every frame.
+const ADD_LIMIT: usize = 60;
+
+/// What the panel says about a size change that the window manager may not have made.
+///
+/// Shown only once the window's settings have been changed, because it is the answer to "why did
+/// nothing happen" rather than a description of anything: before a change it answers a question
+/// nobody has asked.
+const RESTART_NOTE: &str =
+    "Some window managers only apply a size when the client is opened again.";
+
+/// [`RESTART_NOTE`], in the colour of something worth noticing.
+///
+/// The theme's warning colour rather than a yellow of its own. It is orange in both of egui's
+/// themes, which is as close to yellow as is readable — the same yellow that stands out on a
+/// dark window is the one thing on a light one that is harder to read than the small print it
+/// would be replacing.
+fn restart_note(ui: &egui::Ui) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        RESTART_NOTE,
+        0.0,
+        stretch(
+            ui.visuals().warn_fg_color,
+            egui::TextStyle::Body.resolve(ui.style()),
+        ),
+    );
+
+    job
+}
+
+/// What goes between one hint along the bottom of the window and the next.
+///
+/// A middle dot is the character for this, but a middle dot is what the footer already had the
+/// look of: `·` is a hairline, and this wants to read as a separator. egui has no bold to reach
+/// for — `strong()` is a brighter colour, not a heavier stroke, and none of the fonts it carries
+/// has a bold face — so the weight comes from the character instead. Measured at the size the
+/// footer is drawn, a bullet puts down 8.8 of ink against the middle dot's 2.7 in Hack, and 7.0
+/// against 1.4 in Ubuntu-Light; the dot operator `\cdot` is (U+22C5) is no heavier than the
+/// middle dot, and is missing from Ubuntu-Light altogether.
+///
+/// Whichever font the settings put first has to have it, which both of egui's Latin fonts do. It
+/// is also in the set the window's fonts are checked for (`fonts::WRITTEN`), so an order that
+/// cannot draw it is caught by the tests rather than shown as a box.
+const HINT_SEPARATOR: &str = "•";
+
+/// The hints as one line, each separated from the next by [`HINT_SEPARATOR`].
+fn hints(items: &[&str]) -> String {
+    items.join(&format!(" {HINT_SEPARATOR} "))
 }
 
 /// Cuts `text` to `max` characters for a hint, showing that it was cut.

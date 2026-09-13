@@ -6,6 +6,10 @@ edition = "2024"
 [dependencies]
 dirs = "7.0.0"
 eframe = "0.35.0"
+# Phosphor icons for the panel's buttons, at the version that goes with the egui this client
+# uses: 0.14 is for egui 0.36, and two egui versions in one build cannot share a `FontData`.
+egui-phosphor = "0.13.0"
+fontdb = "0.24.0"
 # Skim's matcher, and the reason it is this one: as well as whether a pattern matched, it says
 # *where* it matched, and the window picks those characters out in the row it found. A matcher
 # that only scored a match would leave the highlighting to be worked out a second time, by
