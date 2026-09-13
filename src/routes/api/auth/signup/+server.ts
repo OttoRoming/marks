@@ -14,10 +14,9 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 	if (!parsed.success) {
 		return parsed.response;
 	}
+	const data = parsed.data;
 
-	const { username, password } = parsed.data;
-
-	const username_taken = (await db.$count(user, eq(user.username, username))) > 0;
+	const username_taken = (await db.$count(user, eq(user.username, data.username))) > 0;
 	if (username_taken) {
 		return json(
 			{
@@ -32,11 +31,11 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 	const user_count = await db.$count(user);
 	const is_admin = user_count === 0;
 
-	const password_hash = await hashPassword(password);
+	const password_hash = await hashPassword(data.password);
 
 	const [{ user_id }] = await db
 		.insert(user)
-		.values({ username, password: password_hash, is_admin })
+		.values({ username: data.username, password: password_hash, is_admin })
 		.returning({ user_id: user.id });
 
 	const [new_session] = await db.insert(session).values({ user_id }).returning();

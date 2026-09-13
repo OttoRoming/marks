@@ -1,30 +1,21 @@
 import { blob, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
-import { generateSessionToken } from '../session';
 import dayjs from 'dayjs';
-
-export const task = sqliteTable('task', {
-	id: text('id')
-		.primaryKey()
-		.$defaultFn(() => crypto.randomUUID()),
-	title: text('title').notNull(),
-	priority: integer('priority').notNull().default(1)
-});
 
 export const user = sqliteTable('user', {
 	id: text('id')
 		.primaryKey()
 		.$defaultFn(() => crypto.randomUUID()),
-	username: text('username').unique(),
-	password: text('password'),
-	is_admin: integer({ mode: 'boolean' })
+	username: text('username').notNull().unique(),
+	password: text('password').notNull(),
+	is_admin: integer({ mode: 'boolean' }).notNull().default(false)
 });
 
 export const mark = sqliteTable('mark', {
 	id: text('id')
 		.primaryKey()
 		.$defaultFn(() => crypto.randomUUID()),
-	name: text('name'),
-	content: text('content'),
+	name: text('name').notNull(),
+	content: text('content').notNull(),
 	icon: blob()
 });
 

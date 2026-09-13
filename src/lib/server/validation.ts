@@ -1,5 +1,6 @@
 import { json } from '@sveltejs/kit';
 import { z } from 'zod';
+import { fromError } from 'zod-validation-error';
 
 type ParseJsonBodyResult<T> = { success: true; data: T } | { success: false; response: Response };
 
@@ -23,12 +24,11 @@ export async function parseJsonBody<TSchema extends z.ZodType>(
 
 	const parsed = schema.safeParse(body);
 	if (!parsed.success) {
+		const errorMessage = fromError(parsed.error).toString();
+
 		return {
 			success: false,
-			response: json(
-				{ error: 'Validation failed', fieldErrors: z.flattenError(parsed.error).fieldErrors },
-				{ status: 400 }
-			)
+			response: json({ error: errorMessage }, { status: 400 })
 		};
 	}
 
