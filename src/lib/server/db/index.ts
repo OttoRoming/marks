@@ -9,4 +9,8 @@ if (!env.DATABASE_URL) {
 
 const client = new Database(env.DATABASE_URL);
 
+// SQLite disables foreign key enforcement per connection by default, which would make
+// the schema's `references(... onDelete: 'cascade')` declarative only.
+client.pragma('foreign_keys = ON');
+
 export const db = drizzle(client, { schema });

@@ -1,4 +1,6 @@
 import { blob, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { generateSessionToken } from '../session';
+import dayjs from 'dayjs';
 
 export const task = sqliteTable('task', {
 	id: text('id')
@@ -24,4 +26,19 @@ export const mark = sqliteTable('mark', {
 	name: text('name'),
 	content: text('content'),
 	icon: blob()
+});
+
+export const session = sqliteTable('session', {
+	/** The opaque session token itself, not a UUID: see `createSession`. */
+	id: text('id')
+		.primaryKey()
+		.$defaultFn(() =>
+			Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url')
+		),
+	user_id: text('user_id')
+		.notNull()
+		.references(() => user.id, { onDelete: 'cascade' }),
+	expires_at: integer('expires_at', { mode: 'timestamp_ms' })
+		.notNull()
+		.$defaultFn(() => dayjs().add(30, 'days').toDate())
 });

@@ -11,6 +11,7 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"lint": "prettier --check . && eslint .",
+		"fix": "eslint . --fix && prettier --write .",
 		"format": "prettier --write .",
 		"db:push": "drizzle-kit push",
 		"db:generate": "drizzle-kit generate",
@@ -44,6 +45,7 @@
 	"dependencies": {
 		"@node-rs/argon2": "^2.2.1",
 		"better-sqlite3": "^13.0.2",
+		"dayjs": "^1.11.23",
 		"zod": "^4.6.2"
 	}
 }

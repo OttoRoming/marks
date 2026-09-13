@@ -1,13 +1,15 @@
+import { dev } from '$app/environment';
 import { json } from '@sveltejs/kit';
 import { eq } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
-import { user } from '$lib/server/db/schema';
+import { user, session } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
 import { parseJsonBody } from '$lib/server/validation';
 import { hashPassword } from '$lib/server/password';
 import { signupSchema } from '$lib/schemas/auth';
+import { SESSION_COOKIE_NAME } from '$lib/server/session';
 
-export const POST: RequestHandler = async ({ request }) => {
+export const POST: RequestHandler = async ({ request, cookies }) => {
 	const parsed = await parseJsonBody(request, signupSchema);
 	if (!parsed.success) {
 		return parsed.response;
@@ -32,10 +34,20 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	const password_hash = await hashPassword(password);
 
-	const new_user = await db
+	const [{ user_id }] = await db
 		.insert(user)
 		.values({ username, password: password_hash, is_admin })
-		.returning();
+		.returning({ user_id: user.id });
 
-	return json({ user: new_user }, { status: 201 });
+	const [new_session] = await db.insert(session).values({ user_id }).returning();
+
+	cookies.set(SESSION_COOKIE_NAME, new_session.id, {
+		path: '/',
+		httpOnly: true,
+		sameSite: 'lax',
+		secure: !dev,
+		expires: new_session.expires_at
+	});
+
+	return json({ session: new_session }, { status: 201 });
 };
