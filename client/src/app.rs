@@ -7,6 +7,7 @@ use eframe::egui;
 use crate::api::{Api, ApiError};
 use crate::icons::{IconCache, IconState};
 use crate::mark::{Mark, web_link};
+use crate::title::fetch_title;
 
 /// Where the client looks for the server unless `MARKS_URL` says otherwise: the SvelteKit dev
 /// server, which is where `npm run dev` puts it.
@@ -359,13 +360,20 @@ impl MarksApp {
         // A bare host is stored with its scheme, so the mark both opens and gets a favicon:
         // the server derives the icon from the URL, not from the text it was typed as.
         let content = stored_content(typed);
-        let name = mark_name(&content);
+        // What the mark is called if the page does not name itself (see `named_after_title`).
+        let fallback = mark_name(&content);
 
-        self.notice = Some(Notice::info(format!("Saving \"{name}\"...")));
-        self.spawn(ctx, move || match api.create_mark(&name, &content) {
-            Ok(mark) => Event::Created(mark),
-            Err(ApiError::Unauthorized) => Event::SessionLost,
-            Err(error) => Event::CreateFailed(error.to_string()),
+        self.notice = Some(Notice::info(format!("Saving \"{fallback}\"...")));
+        // The page is fetched here rather than before the spawn, so that a slow site delays
+        // the save rather than the window: the worker is already off the UI thread.
+        self.spawn(ctx, move || {
+            let name = named_after_title(&content, fallback);
+
+            match api.create_mark(&name, &content) {
+                Ok(mark) => Event::Created(mark),
+                Err(ApiError::Unauthorized) => Event::SessionLost,
+                Err(error) => Event::CreateFailed(error.to_string()),
+            }
         });
     }
 
@@ -777,12 +785,38 @@ fn stored_content(typed: &str) -> String {
 /// A link is named after its host, which is also what its favicon stands for; anything else
 /// keeps the text it was typed as. The server caps a name at 200 characters, so it is cut here
 /// rather than refused after a round trip.
+///
+/// This is the name a link is saved under when its page has no title to give; see
+/// [`named_after_title`] for the one it usually gets instead.
 fn mark_name(content: &str) -> String {
     let name = web_link(content)
         .and_then(|url| url.host_str().map(str::to_owned))
         .unwrap_or_else(|| content.to_owned());
 
     name.chars().take(MAX_NAME_CHARS).collect()
+}
+
+/// The name to save a new mark under: the page's own title when it has one, and the name it
+/// would have been given from its host otherwise.
+///
+/// A note is never fetched, and neither is a link that cannot be reached, that answers with
+/// something other than HTML, or that names no title: `fallback` covers all of those at once,
+/// because naming a mark better is never worth losing one over.
+///
+/// Only creation goes through this. Renaming a mark leaves its name alone, and so does
+/// editing the link of one already saved, since the title of a page the user chose a name for
+/// is not this client's to overwrite.
+fn named_after_title(content: &str, fallback: String) -> String {
+    let Some(url) = web_link(content) else {
+        return fallback;
+    };
+
+    match fetch_title(&url) {
+        // Cut to what the server accepts rather than refused after a round trip, as in
+        // `mark_name`.
+        Some(title) => title.chars().take(MAX_NAME_CHARS).collect(),
+        None => fallback,
+    }
 }
 
 /// Cuts `text` to `max` characters for a hint, showing that it was cut.
@@ -921,6 +955,24 @@ mod tests {
     }
 
     #[test]
+    fn a_note_is_named_after_its_text_and_is_never_fetched() {
+        // Nothing off the machine is asked for a name when there is no page to ask: the
+        // fallback is the answer, and typing a note stays as quick as it ever was.
+        let content = "buy milk";
+
+        assert_eq!(named_after_title(content, mark_name(content)), "buy milk");
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_reached_keeps_its_host_name() {
+        // Port 1 on loopback refuses immediately, so this is an offline test that still goes
+        // through the real fetch: the failure leaves the host name it would have had.
+        let content = "http://127.0.0.1:1/";
+
+        assert_eq!(named_after_title(content, mark_name(content)), "127.0.0.1");
+    }
+
+    #[test]
     fn the_ctrl_enter_hint_is_only_there_when_there_is_something_to_save() {
         let ctx = egui::Context::default();
         let mut app = MarksApp::new(&ctx);
@@ -941,6 +993,81 @@ mod tests {
         let cut = shorten(&"x".repeat(100), 10);
         assert_eq!(cut.chars().count(), 11);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    #[ignore = "needs internet access"]
+    fn a_link_is_named_after_the_title_of_the_page_it_points_at() {
+        // example.com is reserved for documentation and has answered with the same title for
+        // decades, which makes it the one title worth writing down in a test.
+        let content = "https://example.com/";
+
+        assert_eq!(
+            named_after_title(content, mark_name(content)),
+            "Example Domain"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a running dev server"]
+    fn ctrl_enter_names_a_new_link_after_the_title_of_its_page() {
+        // The page is served from this machine, so the title that comes back is one this test
+        // wrote rather than whatever the internet has to say today. The marks server is the
+        // real one, so this covers the whole path: typed text, fetched title, stored name.
+        let page = crate::title::serve(
+            "text/html",
+            "<html><head><title>Local Test Page</title></head><body>hello</body></html>",
+        );
+
+        let ctx = egui::Context::default();
+        let mut app = MarksApp::new(&ctx);
+        sign_in(&mut app, &ctx);
+
+        assert!(
+            frame_until(&mut app, &ctx, |app| app.api.is_some()),
+            "not signed in"
+        );
+
+        frame(
+            &mut app,
+            &ctx,
+            vec![egui::Event::Text(page.as_str().to_owned())],
+        );
+        frame(&mut app, &ctx, Vec::new());
+        assert_eq!(app.query, page.as_str(), "typing did not reach the field");
+
+        frame(
+            &mut app,
+            &ctx,
+            vec![press(egui::Key::Enter, egui::Modifiers::CTRL)],
+        );
+
+        assert!(
+            frame_until(&mut app, &ctx, |app| app
+                .marks
+                .iter()
+                .any(|mark| mark.name == "Local Test Page")),
+            "the mark was not named after its page: {:?}",
+            app.notice.as_ref().map(|notice| notice.text.clone())
+        );
+
+        // The name is the client's; what the server stored is what matters, so ask it.
+        let saved = app
+            .marks
+            .iter()
+            .find(|mark| mark.name == "Local Test Page")
+            .cloned()
+            .expect("the new mark");
+        let api = app.api.clone().expect("signed in");
+        let stored = api.list_marks().expect("the server list");
+        let on_server = stored
+            .iter()
+            .find(|mark| mark.id == saved.id)
+            .expect("the server never stored the mark");
+        assert_eq!(on_server.name, "Local Test Page");
+        assert_eq!(on_server.content, page.as_str());
+
+        api.delete_mark(&saved.id).expect("clean up");
     }
 
     #[test]
@@ -1015,7 +1142,15 @@ mod tests {
             .find(|mark| mark.content.starts_with("https://example.com"))
             .cloned()
             .expect("the new mark");
-        assert_eq!(saved.name, "example.com");
+
+        // The page names itself when its title could be fetched, which is the usual case for a
+        // live test; a machine that cannot reach it keeps the host it was named after. Either
+        // way the save went through, which is what this test is about.
+        assert!(
+            matches!(saved.name.as_str(), "Example Domain" | "example.com"),
+            "unexpected name {:?}",
+            saved.name
+        );
 
         let api = app.api.clone().expect("signed in");
         assert!(
