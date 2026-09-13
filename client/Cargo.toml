@@ -1,0 +1,20 @@
+[package]
+name = "marks-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.35.0"
+# Only the decoders for the formats the server can serve are enabled: `sniffImageType`
+# recognises these five formats and nothing else can come back from /api/marks/<id>/icon.
+image = { version = "0.25.10", default-features = false, features = [
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "webp",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ureq = { version = "3.4.1", features = ["json"] }
+url = "2.5.8"
