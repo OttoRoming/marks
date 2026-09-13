@@ -93,11 +93,17 @@ fn no_half_written_file_is_left_behind() {
 fn one_servers_favicons_are_not_anothers() {
     // The same id from two servers: an id means only what the server that issued it says, so the
     // two are kept apart rather than overwriting each other.
-    let first = IconFiles::for_server("http://localhost:5173").expect("a cache");
+    let first = IconFiles::for_server("http://marks.test:8080").expect("a cache");
     let second = IconFiles::for_server("https://marks.example.com").expect("a cache");
 
     assert_ne!(first.dir, second.dir);
-    assert!(first.dir.ends_with("http_localhost_5173"), "{:?}", first.dir);
+    // A dot is a name character and stays one; it is the colon that cannot be, so the port lands on
+    // the end of the same name rather than being dropped.
+    assert!(
+        first.dir.ends_with("http_marks.test_8080"),
+        "{:?}",
+        first.dir
+    );
     assert!(
         second.dir.ends_with("https_marks.example.com"),
         "{:?}",
@@ -107,7 +113,7 @@ fn one_servers_favicons_are_not_anothers() {
 
 #[test]
 fn the_files_are_kept_under_the_cache_directory_and_nowhere_else() {
-    let dir = IconFiles::for_server("http://localhost:5173")
+    let dir = IconFiles::for_server("http://marks.test:8080")
         .expect("a cache")
         .dir;
 

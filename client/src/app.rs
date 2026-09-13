@@ -26,13 +26,6 @@ use crate::search;
 use crate::session_file;
 use crate::title::fetch_title;
 
-/// Where the client looks for the server unless `MARKS_URL` says otherwise: the SvelteKit dev
-/// server, which is where `npm run dev` puts it.
-///
-/// `localhost` rather than `127.0.0.1`, because vite binds the name: on a dual-stack machine
-/// that is `[::1]`, and a literal IPv4 address would be refused.
-const DEFAULT_BASE_URL: &str = "http://localhost:5173";
-
 /// The server rejects a longer name (`markCreateSchema`), so a name derived from the search
 /// box is cut here instead of being refused after a round trip.
 const MAX_NAME_CHARS: usize = 200;
@@ -50,7 +43,15 @@ const HINT_CHARS: usize = 36;
 /// only reacts to what has arrived here.
 pub enum Event {
     /// The credentials were accepted and `api` carries the session cookie from now on.
-    SignedIn { api: Arc<Api>, username: String },
+    ///
+    /// The address comes back with them because it is not necessarily the one the window started
+    /// with: the sign-in dialog asks which server, and the answer can be one this run has never
+    /// seen — which then decides where the favicons are cached, and what gets written down.
+    SignedIn {
+        api: Arc<Api>,
+        username: String,
+        base_url: String,
+    },
     SignInFailed(String),
     Marks(Vec<Mark>),
     MarksFailed(String),
@@ -78,13 +79,19 @@ enum AuthMode {
 /// The sign-in dialog's own state.
 #[derive(Default)]
 struct AuthForm {
+    /// The server to sign in to, as typed.
+    ///
+    /// The dialog is the only place this client is told which server to talk to: it has none of its
+    /// own, so this is where every session begins.
+    base_url: String,
     username: String,
     password: String,
     /// True while a sign-in request is in flight, which disables the form.
     busy: bool,
     error: Option<String>,
-    /// Set when the username field should take the caret on the next frame.
-    focus_username: bool,
+    /// Set when the form should take the caret on the next frame: at the first field that still
+    /// needs filling in, which is the server's address when there is not one yet.
+    focus_first_field: bool,
 }
 
 /// The last thing worth telling the user, shown above the key hints.
@@ -183,8 +190,20 @@ impl MarksApp {
         fonts::install(ctx, &config.fonts.priority, None);
 
         // A session to start from means the window opens signed in, so closing it and opening
-        // it again does not ask for the password a second time.
-        let start = token.map(|token| Arc::new(Api::with_token(base_url.clone(), &token)));
+        // it again does not ask for the password a second time. It takes both halves: a token, and a
+        // server to present it to — which is why a token with no address beside it is no session
+        // here, however it arrived.
+        let start = match token {
+            Some(token) if !base_url.is_empty() => {
+                Some(Arc::new(Api::with_token(base_url.clone(), &token)))
+            }
+            _ => None,
+        };
+
+        // What the sign-in dialog starts filled in with: the address this run was given, from
+        // `MARKS_URL` or from the session the last run kept. Empty when there was nothing to go on,
+        // so that the dialog asks which server rather than guessing at one.
+        let asked_about = base_url.clone();
 
         let (events_tx, events_rx) = mpsc::channel();
 
@@ -207,7 +226,8 @@ impl MarksApp {
             // Without a session to start from, the first thing the app shows is the sign-in
             // dialog, with the caret already in the username field.
             auth: AuthForm {
-                focus_username: true,
+                base_url: asked_about,
+                focus_first_field: true,
                 ..Default::default()
             },
             notice: None,
@@ -237,7 +257,14 @@ impl MarksApp {
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
-                Event::SignedIn { api, username } => {
+                Event::SignedIn {
+                    api,
+                    username,
+                    base_url,
+                } => {
+                    // The address first: the favicon pool is kept per server, so it has to be told
+                    // which server this session turned out to be for before it is started.
+                    self.base_url = base_url;
                     // The favicon pool needs the cookie, so it starts with the session.
                     self.icons = Some(IconCache::new(
                         Arc::clone(&api),
@@ -254,8 +281,9 @@ impl MarksApp {
                 Event::SignInFailed(message) => {
                     self.auth.busy = false;
                     self.auth.error = Some(message);
-                    // After a failed attempt the username is the likely thing to fix.
-                    self.auth.focus_username = true;
+                    // After a failed attempt, the first field still empty is the likely thing to
+                    // fix — the address if it was never given, and the username otherwise.
+                    self.auth.focus_first_field = true;
                 }
                 Event::Marks(marks) => {
                     self.marks = marks;
@@ -264,7 +292,7 @@ impl MarksApp {
                 }
                 Event::MarksFailed(message) => self.notice = Some(Notice::error(message)),
                 Event::SessionLost => {
-                    self.signed_out("That session is no longer valid - sign in again.");
+                    self.signed_out(Some("That session is no longer valid - sign in again."));
                 }
                 Event::Created(mark) => {
                     self.notice = Some(Notice::info(format!("Saved \"{}\".", mark.name)));
@@ -357,11 +385,23 @@ impl MarksApp {
             return;
         }
 
+        // The address is settled here, before anything is sent anywhere: an address that is not one
+        // is worth saying so about, and there is nothing to send it to. What the field is left
+        // holding is the address as the client will use it, so that what is on screen and what is
+        // being talked to are the same thing.
+        let base = match instance_address(&self.auth.base_url) {
+            Ok(base) => base,
+            Err(message) => {
+                self.auth.error = Some(message);
+                return;
+            }
+        };
+
+        self.auth.base_url = base.clone();
         self.auth.busy = true;
         self.auth.error = None;
         self.notice = None;
 
-        let base = self.base_url.clone();
         self.spawn(ctx, move || {
             let mut api = Api::new(base.clone());
             let attempt = match mode {
@@ -381,6 +421,7 @@ impl MarksApp {
                     Event::SignedIn {
                         api: Arc::new(api),
                         username,
+                        base_url: base,
                     }
                 }
                 Err(error) => Event::SignInFailed(error.to_string()),
@@ -389,10 +430,13 @@ impl MarksApp {
     }
 
     /// Drops the session and puts the sign-in dialog back up.
-    fn signed_out(&mut self, reason: &str) {
-        // The token the server has just refused is not worth keeping on disk either — and only
-        // that one, so a session handed in through the environment being refused leaves a good
-        // stored session for the same server alone.
+    ///
+    /// `reason` is what to say about it, and is nothing at all when the user asked for this: a
+    /// session that was refused is worth explaining, and a logout is not.
+    fn signed_out(&mut self, reason: Option<&str>) {
+        // The token is not worth keeping on disk either — and only that one, so a session handed in
+        // through the environment being refused leaves a good stored session for the same server
+        // alone. This is also what a logout does: the session the user is leaving goes with them.
         if let Some(token) = self.api.as_ref().and_then(|api| api.token()) {
             session_file::forget(&self.base_url, token);
         }
@@ -405,8 +449,11 @@ impl MarksApp {
         // The sign-in dialog takes the window back, so the panel has no business being up.
         self.config_open = false;
         self.auth = AuthForm {
-            error: Some(reason.to_owned()),
-            focus_username: true,
+            // The address stays: it is not a secret, and it is what the user would otherwise have
+            // to type again to get back in. Everything else about the session is gone.
+            base_url: self.base_url.clone(),
+            error: reason.map(str::to_owned),
+            focus_first_field: true,
             ..Default::default()
         };
     }
@@ -577,13 +624,19 @@ impl MarksApp {
         egui::Modal::new(egui::Id::new("sign-in")).show(ctx, |ui| {
             ui.set_width(300.0);
             ui.heading("Marks");
-            ui.label(
-                egui::RichText::new(format!("Sign in to {}", self.base_url))
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(8.0);
 
+            // The server comes first, because it is the first thing that has to be right: this
+            // client has no server of its own to fall back on, and a session belongs to one server.
+            ui.add_space(8.0);
+            ui.label("Server");
+            let server = ui.add_enabled(
+                !self.auth.busy,
+                egui::TextEdit::singleline(&mut self.auth.base_url)
+                    .hint_text("https://marks.example.com")
+                    .desired_width(f32::INFINITY),
+            );
+
+            ui.add_space(4.0);
             ui.label("Username");
             let username = ui.add_enabled(
                 !self.auth.busy,
@@ -616,11 +669,17 @@ impl MarksApp {
                 });
             });
 
-            // The dialog is the only thing to type into while it is up, so the caret starts
-            // where the user has to start.
-            if self.auth.focus_username {
-                username.request_focus();
-                self.auth.focus_username = false;
+            // The dialog is the only thing to type into while it is up, so the caret starts where
+            // the user has to start: at the server's address when there is not one yet, and at the
+            // username when there is.
+            if self.auth.focus_first_field {
+                if self.auth.base_url.trim().is_empty() {
+                    server.request_focus();
+                } else {
+                    username.request_focus();
+                }
+
+                self.auth.focus_first_field = false;
             }
         });
 
@@ -782,6 +841,9 @@ impl MarksApp {
         let mut moved = None;
         let mut removed = None;
         let mut added = None;
+        // Leaving the session, which is a bigger decision than any of the others and the only one
+        // that ends the panel's business.
+        let mut log_out = false;
 
         // What is left of the window once the panel's own margins are taken out of it. A window
         // can be set smaller than the panel is tall — the smallest it may be is — and without
@@ -794,6 +856,28 @@ impl MarksApp {
 
             egui::ScrollArea::vertical().max_height(room).show(ui, |ui| {
             ui.heading("Configuration");
+
+            // Who this window is signed in as, and to what, with the one way back to the sign-in
+            // dialog. At the top rather than in a section of its own at the foot: the panel scrolls
+            // in a window that is short, and leaving a session should not be the control that has to
+            // be scrolled to.
+            //
+            // The username is not always known: a session handed in through the environment is a
+            // session without a sign-in, and this run never learned whose it is.
+            ui.add_space(6.0);
+            ui.weak(match &self.username {
+                Some(username) => format!("Signed in as {username} to {}", self.base_url),
+                None => format!("Signed in to {}", self.base_url),
+            });
+            ui.add_space(4.0);
+            if ui
+                .button("Log out")
+                .on_hover_text("Forget this session, and sign in to any server")
+                .clicked()
+            {
+                log_out = true;
+            }
+
             ui.add_space(10.0);
 
             ui.strong("Window");
@@ -983,6 +1067,14 @@ impl MarksApp {
             ui.weak("Ctrl+, or Esc closes this panel");
             });
         });
+
+        // Logging out is the end of the session rather than a change to it: nothing else that was
+        // worked out while the panel was drawn is worth carrying out afterwards, and the panel has
+        // just been taken down with the session.
+        if log_out {
+            self.signed_out(None);
+            return;
+        }
 
         // One decision, applied and written in the same breath; then the size, which is applied
         // as it moves and written when it settles.
@@ -1340,21 +1432,81 @@ fn handed_in_token() -> Option<String> {
 /// The server to talk to, and the session to start from, from the environment and from the
 /// session kept on disk.
 ///
-/// `MARKS_URL` names the server, and `MARKS_TOKEN` hands in a session directly. With none
-/// handed in, the session the last run kept is used. The environment wins, because a session
-/// handed in was asked for on purpose and a stale one on disk should not overrule it.
+/// There is no server this client falls back on. The sign-in dialog asks which one, and the answer
+/// is kept with the session, so a window that has run before opens against the server the last run
+/// used — and one that never has opens with the dialog asking and nothing filled in.
+///
+/// `MARKS_URL` names a server outright, and `MARKS_TOKEN` hands in a session for it: the two
+/// together are how a session that exists elsewhere — a browser, a script, another window — is
+/// reused without signing in again. The environment wins, because a session handed in was asked for
+/// on purpose and a stale one on disk should not overrule it. A `MARKS_TOKEN` with no `MARKS_URL`
+/// beside it is nothing this client can use: there is no server to present it to.
 ///
 /// Called by `main` only: everything here reads something off the machine, which is exactly
 /// what a test should not be doing.
 pub fn starting_session() -> (String, Option<String>) {
-    let base_url = std::env::var("MARKS_URL")
-        .unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
-        .trim_end_matches('/')
-        .to_owned();
+    let named = std::env::var("MARKS_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty());
 
-    let token = handed_in_token().or_else(|| session_file::load(&base_url));
+    // The session kept on disk, whichever server it was kept for: with nothing named, its address
+    // is the only one there is to go on.
+    let stored = session_file::stored();
+    let base_url = server_to_start_from(
+        named,
+        stored.as_ref().map(|(base_url, _)| base_url.as_str()),
+    );
+
+    let token = if base_url.is_empty() {
+        None
+    } else {
+        handed_in_token().or_else(|| session_file::load(&base_url))
+    };
 
     (base_url, token)
+}
+
+/// Which server to open against: the one the environment names, or the one the last run's session
+/// was kept for, and nothing at all when neither says.
+///
+/// A function of those two answers rather than of the machine, so that the rule this client is built
+/// on — that it has no server of its own — is one a test can hold it to without reading anything off
+/// the machine it happens to be running on.
+fn server_to_start_from(named: Option<String>, stored: Option<&str>) -> String {
+    named
+        .or_else(|| stored.map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The server address as typed into the sign-in dialog, in the form the rest of this client uses:
+/// a scheme, a host, and no trailing slash.
+///
+/// A bare host is taken as `http://`, the way the search box takes a bare host as a mark: the
+/// address is typed by hand, and nobody types the scheme first. Anything without a host in it is
+/// refused, because a client pointed at nothing can only fail later and less clearly — and the
+/// dialog is the one place where the mistake is still cheap to correct.
+fn instance_address(typed: &str) -> Result<String, String> {
+    let trimmed = typed.trim().trim_end_matches('/');
+
+    if trimmed.is_empty() {
+        return Err("Which server? Type its address.".to_owned());
+    }
+
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_owned()
+    } else {
+        format!("http://{trimmed}")
+    };
+
+    match url::Url::parse(&with_scheme) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => {
+            // Through the parser and back, so that what is used, what is written down, and what the
+            // dialog then shows are all the same string.
+            Ok(url.as_str().trim_end_matches('/').to_owned())
+        }
+        _ => Err(format!("{trimmed} is not a server address.")),
+    }
 }
 
 /// Whether an edit to a number is over, so that what it left can be written down.

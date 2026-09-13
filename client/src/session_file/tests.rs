@@ -39,8 +39,8 @@ impl std::ops::Deref for Scratch {
     }
 }
 
-const SERVER: &str = "http://localhost:5173";
-const OTHER_SERVER: &str = "http://localhost:9999";
+const SERVER: &str = "http://marks.test";
+const OTHER_SERVER: &str = "http://other.test";
 
 #[test]
 fn a_session_is_still_there_when_the_client_next_asks_for_it() {
@@ -61,6 +61,38 @@ fn a_session_is_kept_for_the_server_that_issued_it() {
     // particular it is not sent there.
     assert_eq!(read_from(&dir, OTHER_SERVER), None);
     assert_eq!(read_from(&dir, SERVER).as_deref(), Some("token-value"));
+}
+
+#[test]
+fn what_is_stored_can_be_read_without_knowing_which_server_it_is_for() {
+    // Which is what the window needs at startup: it is not told which server to talk to, so the
+    // address in the sign-in dialog can only come from what the last run left behind.
+    let dir = Scratch::new("whatever-is-stored");
+
+    write_to(&dir, SERVER, "token-value").expect("a session written");
+
+    assert_eq!(
+        stored_in(&dir),
+        Some((SERVER.to_owned(), "token-value".to_owned()))
+    );
+}
+
+#[test]
+fn a_file_with_no_server_in_it_is_not_a_session_to_offer_anyone() {
+    // A token with nowhere to present it is not a session, and an address is what the dialog would
+    // be filled in with: a file missing either half is no help to a window that has neither.
+    let dir = Scratch::new("no-server");
+    fs::create_dir_all(&*dir).expect("a directory");
+    let path = dir.join(FILE_NAME);
+
+    for contents in [
+        r#"{"base_url":"","token":"token-value"}"#,
+        r#"{"base_url":"http://marks.test","token":""}"#,
+    ] {
+        fs::write(&path, contents).expect("a file written");
+
+        assert_eq!(stored_in(&dir), None, "contents: {contents}");
+    }
 }
 
 #[test]
@@ -102,8 +134,8 @@ fn a_file_that_is_not_a_session_is_not_used() {
         "",
         "not json",
         "{}",
-        r#"{"base_url":"http://localhost:5173"}"#,
-        r#"{"base_url":"http://localhost:5173","token":""}"#,
+        r#"{"base_url":"http://marks.test"}"#,
+        r#"{"base_url":"http://marks.test","token":""}"#,
         r#"{"base_url":null,"token":"x"}"#,
     ] {
         fs::write(&path, contents).expect("a file written");

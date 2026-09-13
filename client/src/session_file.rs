@@ -45,6 +45,16 @@ pub fn load(base_url: &str) -> Option<String> {
     read_from(&data_dir()?, base_url)
 }
 
+/// The session kept on disk, and the server that issued it, whoever that is.
+///
+/// [`load`] asks for the session of a named server, which is what a window that already knows which
+/// server it is talking to wants. This asks what is there at all, which is what a window that has
+/// not been told yet wants: this client has no server of its own to fall back on, so the address it
+/// should offer is the one the last run's session was kept for.
+pub fn stored() -> Option<(String, String)> {
+    stored_in(&data_dir()?)
+}
+
 /// Keeps `token` for `base_url`, so that the next run starts signed in.
 ///
 /// Not being able to write is not worth failing a sign-in over: the session works for as long
@@ -78,6 +88,13 @@ pub fn forget(base_url: &str, token: &str) {
 
 /// The session in `dir`, when there is one and it belongs to `base_url`.
 fn read_from(dir: &Path, base_url: &str) -> Option<String> {
+    stored_in(dir)
+        .filter(|(stored, _)| stored == base_url)
+        .map(|(_, token)| token)
+}
+
+/// The session in `dir`, with the server it belongs to: the whole of the file, when it is one.
+fn stored_in(dir: &Path) -> Option<(String, String)> {
     let contents = fs::read_to_string(dir.join(FILE_NAME)).ok()?;
 
     // A file that is truncated, hand-edited, or left over from another version of this client
@@ -85,7 +102,10 @@ fn read_from(dir: &Path, base_url: &str) -> Option<String> {
     // answer to all three, and leaves the file for `save` to overwrite.
     let stored: Stored = serde_json::from_str(&contents).ok()?;
 
-    (stored.base_url == base_url && !stored.token.is_empty()).then_some(stored.token)
+    // A session with no server is not one, whatever token came with it: the address is what the
+    // sign-in dialog would be filled in with, and a token with nowhere to present it is nothing
+    // this client can use.
+    (!stored.base_url.is_empty() && !stored.token.is_empty()).then_some((stored.base_url, stored.token))
 }
 
 /// Writes `token` into `dir`, making the directory if it is not there yet.

@@ -7,6 +7,13 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// A server address for the tests that never contact one.
+///
+/// `.test` is reserved for this and can never resolve, so a test that named it and then reached for
+/// a socket would fail rather than quietly talk to whatever this machine happens to be running on
+/// its development port.
+const SERVER: &str = "http://marks.test";
+
 /// How long a test waits for a worker thread's answer to reach the window.
 const PATIENCE: Duration = Duration::from_secs(20);
 
@@ -189,8 +196,8 @@ fn a_session_the_server_refuses_puts_the_sign_in_dialog_back_up() {
         Some("That session is no longer valid - sign in again.")
     );
     assert!(
-        app.auth.focus_username,
-        "the caret belongs in the username field"
+        app.auth.focus_first_field,
+        "the form should be given the caret back"
     );
 
     // And nothing the refused session had is left on screen.
@@ -297,6 +304,207 @@ fn a_window_with_no_session_asks_the_server_for_nothing() {
     assert!(app.api.is_none());
     assert!(app.auth.error.is_none());
     assert!(app.marks.is_empty());
+}
+
+#[test]
+fn a_server_address_typed_by_hand_is_read_the_way_the_client_will_use_it() {
+    // A scheme, a host and no trailing slash, with a bare host taken as `http://` the way the
+    // search box takes one as a mark: an address is typed by hand, and nobody types the scheme
+    // first.
+    assert_eq!(
+        instance_address("marks.example.com").as_deref(),
+        Ok("http://marks.example.com")
+    );
+    assert_eq!(
+        instance_address("  https://marks.example.com/  ").as_deref(),
+        Ok("https://marks.example.com")
+    );
+    assert_eq!(
+        instance_address("marks.example.com:8080/").as_deref(),
+        Ok("http://marks.example.com:8080")
+    );
+
+    // And what is not an address is refused, with something to read: the dialog is the one place
+    // where the mistake is still cheap to correct.
+    for typed in ["", "   ", "/", "not a server", "ftp://marks.example.com"] {
+        assert!(
+            instance_address(typed).is_err(),
+            "{typed:?} was taken for a server address"
+        );
+    }
+}
+
+#[test]
+fn there_is_no_server_to_open_against_until_one_is_named() {
+    // The rule this client is built on: it has no server of its own. What it opens against is the
+    // one `MARKS_URL` names, or the one the last run's session was kept for — and with neither,
+    // nothing at all, which is what leaves the sign-in dialog asking.
+    assert_eq!(server_to_start_from(None, None), "");
+
+    assert_eq!(
+        server_to_start_from(Some("http://named.test".to_owned()), None),
+        "http://named.test"
+    );
+    assert_eq!(
+        server_to_start_from(None, Some("http://remembered.test")),
+        "http://remembered.test"
+    );
+
+    // The environment wins over the session on disk: that one was asked for on purpose, and a stale
+    // one should not overrule it.
+    assert_eq!(
+        server_to_start_from(
+            Some("http://named.test".to_owned()),
+            Some("http://remembered.test")
+        ),
+        "http://named.test"
+    );
+}
+
+#[test]
+fn the_sign_in_dialog_asks_which_server_and_sends_nothing_without_one() {
+    // This client has no server of its own. Given nothing — no `MARKS_URL` handed in, and no
+    // session kept from an earlier run — the dialog is where the address comes from, and it starts
+    // empty.
+    let (mut app, ctx) = window("", None);
+
+    assert!(
+        app.base_url.is_empty(),
+        "a window with no server was given one anyway"
+    );
+    assert!(
+        app.auth.base_url.is_empty(),
+        "the address field was filled in for the user"
+    );
+
+    // It is on screen, under its own label, with the shape an address has. A modal lays itself out
+    // on one frame and draws on the next, so the dialog is drawn before it is looked at.
+    frame(&mut app, &ctx, Vec::new());
+    frame(&mut app, &ctx, Vec::new());
+
+    assert!(
+        drew(&mut app, &ctx, "Server"),
+        "the dialog does not ask which server"
+    );
+    assert!(drew(&mut app, &ctx, "https://marks.example.com"));
+
+    // And signing in without one says so, rather than failing somewhere further along: nothing was
+    // sent anywhere, which is what the form still being usable means.
+    app.auth.username = "someone".to_owned();
+    app.auth.password = "secret".to_owned();
+    app.authenticate(&ctx, AuthMode::Login);
+
+    assert_eq!(
+        app.auth.error.as_deref(),
+        Some("Which server? Type its address.")
+    );
+    assert!(
+        !app.auth.busy,
+        "a request was made with no server to make it to"
+    );
+    assert!(app.api.is_none());
+}
+
+#[test]
+fn the_dialog_signs_in_to_the_server_typed_into_it_and_not_to_another() {
+    // Two servers are listening, and the address of one of them is typed into the dialog. Both
+    // refuse the sign-in, so nothing is written down: what is being tested is where the request
+    // went, not what came back.
+    let typed = refused();
+    let other = refused();
+
+    let (mut app, ctx) = window("", None);
+    app.auth.base_url = typed.url.to_string();
+    app.auth.username = "someone".to_owned();
+    app.auth.password = "secret".to_owned();
+
+    app.authenticate(&ctx, AuthMode::Login);
+
+    assert!(app.auth.busy, "the sign-in was not attempted at all");
+    assert!(
+        wait_until(&mut app, &ctx, |_| typed.request.try_recv().is_ok()),
+        "the address in the dialog was not the one that was asked"
+    );
+    assert!(
+        other.request.try_recv().is_err(),
+        "a server that was not named was asked"
+    );
+}
+
+#[test]
+fn a_session_signed_in_elsewhere_is_taken_up_with_its_own_server() {
+    // The address the sign-in answers with decides where the window is: the dialog asks, and the
+    // answer can be a server this run has never seen. It decided where the favicons are kept and
+    // what the next run's dialog will offer, so it is not the address the window started with.
+    let server = test_page::serve_answers(vec![marks_ok()]);
+    let elsewhere = server.url.to_string();
+
+    let (mut app, ctx) = window("http://marks.test", None);
+    assert_ne!(
+        app.base_url, elsewhere,
+        "the window started out already pointed at the server the sign-in names"
+    );
+
+    app.events_tx
+        .send(Event::SignedIn {
+            api: Arc::new(Api::with_token(elsewhere.clone(), "a-token")),
+            username: "someone".to_owned(),
+            base_url: elsewhere.clone(),
+        })
+        .expect("an event sent to the window");
+
+    app.drain_events(&ctx);
+
+    assert_eq!(app.base_url, elsewhere);
+    assert_eq!(app.username.as_deref(), Some("someone"));
+    assert!(app.api.is_some());
+    assert!(
+        app.icons.is_some(),
+        "the favicons were not started for the server that was signed in to"
+    );
+}
+
+#[test]
+fn the_panel_can_log_out_and_the_dialog_asks_again() {
+    let settings = Settings::new("log-out");
+    let (mut app, ctx) = signed_in(settings.config());
+    app.config_open = true;
+
+    for _ in 0..2 {
+        frame(&mut app, &ctx, Vec::new());
+    }
+
+    assert!(
+        drew(&mut app, &ctx, "Log out"),
+        "the panel has no way to leave the session"
+    );
+
+    let button = text_pos(&mut app, &ctx, "Log out");
+    click(&mut app, &ctx, button);
+
+    // The session is gone, the panel with it, and the dialog is back.
+    assert!(app.api.is_none(), "the session outlived the logout");
+    assert!(app.username.is_none());
+    assert!(!app.config_open, "the panel stayed up over the dialog");
+    assert!(
+        app.auth.error.is_none(),
+        "a logout the user asked for was reported as a failure"
+    );
+
+    // The dialog is laid out on the frame after the one that took the session away, so it is drawn
+    // before it is looked at.
+    frame(&mut app, &ctx, Vec::new());
+    assert!(
+        drew(&mut app, &ctx, "Log in"),
+        "the sign-in dialog did not come back"
+    );
+
+    // And the address is left in the dialog, so that getting back in is a password rather than the
+    // address typed out again. Only the session in use was forgotten: `forget` removes a stored
+    // session when it is that one, and this is the test's own server, not the one this machine's
+    // client is signed in to.
+    assert_eq!(app.auth.base_url, app.base_url);
+    assert!(!app.auth.base_url.is_empty(), "the dialog lost the server");
 }
 
 /// A window that is signed in, so that the launcher keys are the ones in play.
@@ -440,7 +648,7 @@ fn the_panel_leaves_the_launcher_keys_alone_while_it_is_up() {
 #[test]
 fn a_fixed_size_is_applied_to_the_window_and_written_down() {
     let settings = Settings::new("fixed");
-    let (mut app, ctx) = window_with("http://localhost:5173", None, settings.config());
+    let (mut app, ctx) = window_with(SERVER, None, settings.config());
 
     assert!(!app.config.window.fixed_size);
 
@@ -466,7 +674,7 @@ fn a_fixed_size_is_applied_to_the_window_and_written_down() {
 #[test]
 fn a_size_no_window_could_be_is_brought_within_reach_and_written_down() {
     let settings = Settings::new("size");
-    let (mut app, ctx) = window_with("http://localhost:5173", None, settings.config());
+    let (mut app, ctx) = window_with(SERVER, None, settings.config());
 
     // As the panel leaves them when a number is typed into it.
     app.config.window.width = 3;
@@ -484,7 +692,7 @@ fn a_size_no_window_could_be_is_brought_within_reach_and_written_down() {
 #[test]
 fn moving_a_font_up_the_order_puts_it_first_and_writes_it_down() {
     let settings = Settings::new("fonts");
-    let (mut app, ctx) = window_with("http://localhost:5173", None, settings.config());
+    let (mut app, ctx) = window_with(SERVER, None, settings.config());
     // A frame first: egui does not know what the fonts are until one has been drawn.
     frame(&mut app, &ctx, Vec::new());
 
@@ -508,7 +716,7 @@ fn moving_a_font_up_the_order_puts_it_first_and_writes_it_down() {
 #[test]
 fn a_font_cannot_be_moved_off_either_end_of_the_order() {
     let settings = Settings::new("fonts-ends");
-    let (mut app, ctx) = window_with("http://localhost:5173", None, settings.config());
+    let (mut app, ctx) = window_with(SERVER, None, settings.config());
     let before = app.config.fonts.priority.clone();
 
     app.move_font(&ctx, 0, -1);
@@ -522,7 +730,7 @@ fn a_font_cannot_be_moved_off_either_end_of_the_order() {
 #[test]
 fn a_settings_file_that_says_nothing_leaves_the_window_as_it_was() {
     let settings = Settings::new("defaults");
-    let (app, _) = window_with("http://localhost:5173", None, settings.config());
+    let (app, _) = window_with(SERVER, None, settings.config());
 
     assert_eq!(app.config.window.width, 620);
     assert_eq!(app.config.window.height, 440);
@@ -1495,7 +1703,7 @@ fn asks_in_order(wanted: &[egui::ViewportCommand], commands: &[egui::ViewportCom
 #[test]
 fn fixing_the_size_constrains_the_window_and_does_so_after_resizing_it() {
     let settings = Settings::new("pinning");
-    let (mut app, ctx) = window_with("http://localhost:5173", None, settings.config());
+    let (mut app, ctx) = window_with(SERVER, None, settings.config());
 
     app.set_fixed_size(&ctx, true);
 
@@ -1525,7 +1733,7 @@ fn fixing_the_size_constrains_the_window_and_does_so_after_resizing_it() {
 #[test]
 fn freeing_the_size_lets_the_window_be_resized_again() {
     let settings = Settings::new("freeing");
-    let (mut app, ctx) = window_with("http://localhost:5173", None, settings.config());
+    let (mut app, ctx) = window_with(SERVER, None, settings.config());
 
     app.set_fixed_size(&ctx, true);
     viewport_commands(&mut app, &ctx);
@@ -1556,7 +1764,7 @@ fn freeing_the_size_lets_the_window_be_resized_again() {
 
 #[test]
 fn the_ctrl_enter_hint_is_only_there_when_there_is_something_to_save() {
-    let (mut app, _) = window("http://localhost:5173", None);
+    let (mut app, _) = window(SERVER, None);
 
     assert_eq!(app.save_hint(), None);
 
