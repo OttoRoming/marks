@@ -14,6 +14,9 @@ export const mark = sqliteTable('mark', {
 	id: text('id')
 		.primaryKey()
 		.$defaultFn(() => crypto.randomUUID()),
+	user_id: text('user_id')
+		.notNull()
+		.references(() => user.id, { onDelete: 'cascade' }),
 	name: text('name').notNull(),
 	content: text('content').notNull(),
 	icon: blob()
