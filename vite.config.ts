@@ -21,6 +21,9 @@ export default defineConfig({
 			typescript: {
 				config: (config) => {
 					config.include.push('../drizzle.config.ts');
+					// Tests live outside src/, so add them explicitly to keep svelte-check
+					// type-checking them.
+					config.include.push('../tests/**/*.ts');
 				}
 			}
 		})
