@@ -1,21 +1,21 @@
-import { json } from '@sveltejs/kit';
 import { eq } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
 import { icon } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
+import { notFound, requireUser } from '$lib/server/api';
 import { sniffImageType } from '$lib/server/favicon';
 import { getOwnMark } from '$lib/server/marks';
 
 /** Serves the mark's stored favicon bytes. */
 export const GET: RequestHandler = async ({ params, locals }) => {
-	const user = locals.user;
-	if (!user) {
-		return json({ error: 'Unauthorized' }, { status: 401 });
+	const auth = requireUser(locals);
+	if (!auth.success) {
+		return auth.response;
 	}
 
-	const existing = await getOwnMark(params.id, user.id);
+	const existing = await getOwnMark(params.id, auth.user.id);
 	if (!existing?.icon_id) {
-		return json({ error: 'Icon not found' }, { status: 404 });
+		return notFound('Icon not found');
 	}
 
 	const [row] = await db
@@ -25,7 +25,7 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 
 	const bytes = row?.content;
 	if (!bytes || bytes.byteLength === 0) {
-		return json({ error: 'Icon not found' }, { status: 404 });
+		return notFound('Icon not found');
 	}
 
 	// The type is sniffed from the bytes rather than stored, because DuckDuckGo's

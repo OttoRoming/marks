@@ -3,6 +3,7 @@ import { eq } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
 import { mark } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
+import { notFound, requireUser } from '$lib/server/api';
 import { parseJsonBody } from '$lib/server/validation';
 import { fetchFavicon } from '$lib/server/favicon';
 import {
@@ -13,17 +14,18 @@ import {
 } from '$lib/server/marks';
 import { markUpdateSchema } from '$lib/schemas/mark';
 
+/** A mark the caller cannot see is reported as missing, never as forbidden: see `getOwnMark`. */
 function not_found() {
-	return json({ error: 'Mark not found' }, { status: 404 });
+	return notFound('Mark not found');
 }
 
 export const GET: RequestHandler = async ({ params, locals }) => {
-	const user = locals.user;
-	if (!user) {
-		return json({ error: 'Unauthorized' }, { status: 401 });
+	const auth = requireUser(locals);
+	if (!auth.success) {
+		return auth.response;
 	}
 
-	const existing = await getOwnMark(params.id, user.id);
+	const existing = await getOwnMark(params.id, auth.user.id);
 	if (!existing) {
 		return not_found();
 	}
@@ -33,12 +35,12 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 };
 
 export const PATCH: RequestHandler = async ({ params, request, locals }) => {
-	const user = locals.user;
-	if (!user) {
-		return json({ error: 'Unauthorized' }, { status: 401 });
+	const auth = requireUser(locals);
+	if (!auth.success) {
+		return auth.response;
 	}
 
-	const existing = await getOwnMark(params.id, user.id);
+	const existing = await getOwnMark(params.id, auth.user.id);
 	if (!existing) {
 		return not_found();
 	}
@@ -80,12 +82,12 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 };
 
 export const DELETE: RequestHandler = async ({ params, locals }) => {
-	const user = locals.user;
-	if (!user) {
-		return json({ error: 'Unauthorized' }, { status: 401 });
+	const auth = requireUser(locals);
+	if (!auth.success) {
+		return auth.response;
 	}
 
-	const existing = await getOwnMark(params.id, user.id);
+	const existing = await getOwnMark(params.id, auth.user.id);
 	if (!existing) {
 		return not_found();
 	}

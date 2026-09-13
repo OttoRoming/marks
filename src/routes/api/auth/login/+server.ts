@@ -3,6 +3,7 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { user, session } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
+import { unauthorized } from '$lib/server/api';
 import { parseJsonBody } from '$lib/server/validation';
 import { verifyPassword } from '$lib/server/password';
 import { signupSchema } from '$lib/schemas/auth';
@@ -22,12 +23,9 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 		.from(user)
 		.where(eq(user.username, data.username));
 
-	const failed_login_response = json(
-		{
-			error: 'Incorrect username or password'
-		},
-		{ status: 401 }
-	);
+	// An unknown username and a wrong password answer identically, so the response cannot be
+	// used to find out which usernames exist.
+	const failed_login_response = unauthorized('Incorrect username or password');
 
 	if (selected_user === undefined) {
 		return failed_login_response;

@@ -1,6 +1,6 @@
-import { json } from '@sveltejs/kit';
 import { z } from 'zod';
 import { fromError } from 'zod-validation-error';
+import { badRequest } from './api';
 
 type ParseJsonBodyResult<T> = { success: true; data: T } | { success: false; response: Response };
 
@@ -19,7 +19,7 @@ export async function parseJsonBody<TSchema extends z.ZodType>(
 	try {
 		body = await request.json();
 	} catch {
-		return { success: false, response: json({ error: 'Invalid JSON body' }, { status: 400 }) };
+		return { success: false, response: badRequest('Invalid JSON body') };
 	}
 
 	const parsed = schema.safeParse(body);
@@ -28,7 +28,7 @@ export async function parseJsonBody<TSchema extends z.ZodType>(
 
 		return {
 			success: false,
-			response: json({ error: errorMessage }, { status: 400 })
+			response: badRequest(errorMessage)
 		};
 	}
 

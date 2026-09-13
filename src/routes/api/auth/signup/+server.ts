@@ -4,6 +4,7 @@ import { eq } from 'drizzle-orm';
 import type { RequestHandler } from './$types';
 import { user, session } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
+import { conflict } from '$lib/server/api';
 import { parseJsonBody } from '$lib/server/validation';
 import { hashPassword } from '$lib/server/password';
 import { signupSchema } from '$lib/schemas/auth';
@@ -18,13 +19,11 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 
 	const username_taken = (await db.$count(user, eq(user.username, data.username))) > 0;
 	if (username_taken) {
-		return json(
-			{
-				error: 'Username is already taken',
-				fieldErrors: { username: ['Username is already taken'] }
-			},
-			{ status: 409 }
-		);
+		// One message serves both halves: the client shows `error` at large, and uses
+		// `fieldErrors` to mark the username input itself.
+		const message = 'Username is already taken';
+
+		return conflict(message, { username: [message] });
 	}
 
 	// The first user should always be admin
