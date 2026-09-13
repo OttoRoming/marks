@@ -18,6 +18,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// cannot make the decoder chew through something enormous.
 const MAX_ICON_BYTES: u64 = 1024 * 1024;
 
+/// The name the server gives its session cookie, which is `SESSION_COOKIE_NAME` on the other
+/// side of the wire. Both the header this client sends and the one the server answers with are
+/// read by this name, so it is written down once.
+const SESSION_COOKIE: &str = "token";
+
 /// Why a request failed, reduced to what the UI does about it.
 #[derive(Debug)]
 pub enum ApiError {
@@ -44,13 +49,15 @@ type ApiResult<T> = Result<T, ApiError>;
 ///
 /// Requests are blocking, so every call belongs on a worker thread: the UI thread only ever
 /// reads what came back (see `MarksApp::spawn`). After [`Api::login`] or [`Api::signup`] the
-/// session cookie travels on every later request, which is what makes an [`Api`] the thing
+/// session token travels on every later request, which is what makes an [`Api`] the thing
 /// the rest of the app shares once it is `Arc`-wrapped.
 pub struct Api {
     agent: Agent,
     base: String,
-    /// The `token=<value>` pair from the session cookie.
-    cookie: Option<String>,
+    /// The value of the session cookie the server set, without the name or the attributes it
+    /// travels with. Kept as the value rather than as the whole header so that a caller can
+    /// hold on to it (see [`Api::token`] and `session_file`).
+    token: Option<String>,
 }
 
 impl Api {
@@ -66,7 +73,7 @@ impl Api {
         Self {
             agent: Agent::new_with_config(config),
             base: base.into().trim_end_matches('/').to_owned(),
-            cookie: None,
+            token: None,
         }
     }
 
@@ -76,9 +83,17 @@ impl Api {
     /// token value is all this needs.
     pub fn with_token(base: impl Into<String>, token: &str) -> Self {
         let mut api = Self::new(base);
-        api.cookie = Some(format!("token={token}"));
+        api.token = Some(token.to_owned());
 
         api
+    }
+
+    /// The session token this client signs its requests with, if it has one.
+    ///
+    /// Handed out so that the session can outlive the process: whoever signs in writes what
+    /// comes back here somewhere the next run can read it (`session_file::save`).
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     /// Signs in to an existing account and keeps the session cookie the server sets.
@@ -158,8 +173,8 @@ impl Api {
         // 200 for an existing account, 201 for a new one; both carry the session cookie.
         read_json::<serde_json::Value>(&mut response)?;
 
-        self.cookie = session_cookie(&response);
-        if self.cookie.is_none() {
+        self.token = session_token(&response);
+        if self.token.is_none() {
             return Err(ApiError::Message(
                 "The server accepted the credentials but sent no session cookie.".to_owned(),
             ));
@@ -180,13 +195,13 @@ impl Api {
         format!("{}{path}", self.base)
     }
 
-    /// The session cookie, when there is one, is attached to whatever request is being built.
+    /// The session token, when there is one, is attached to whatever request is being built.
     ///
     /// This is what lets the same helper serve both the unauthenticated sign-in calls and
     /// every call that follows them.
     fn authorize<S>(&self, request: ureq::RequestBuilder<S>) -> ureq::RequestBuilder<S> {
-        match &self.cookie {
-            Some(cookie) => request.header("cookie", cookie.as_str()),
+        match &self.token {
+            Some(token) => request.header("cookie", format!("{SESSION_COOKIE}={token}")),
             None => request,
         }
     }
@@ -233,13 +248,14 @@ fn error_message(response: &mut Response<Body>) -> String {
         .unwrap_or_else(|_| format!("The server answered {status}."))
 }
 
-/// The `set-cookie` header reads `token=<value>; Path=/; HttpOnly; ...`; only the pair
-/// matters here, since the attributes describe browser behaviour a native client has none of.
-fn session_cookie(response: &Response<Body>) -> Option<String> {
+/// The `set-cookie` header reads `token=<value>; Path=/; HttpOnly; ...`; only the value is
+/// wanted here, since the attributes describe browser behaviour a native client has none of.
+fn session_token(response: &Response<Body>) -> Option<String> {
     let header = response.headers().get("set-cookie")?.to_str().ok()?;
     let pair = header.split(';').next()?.trim();
+    let value = pair.strip_prefix(SESSION_COOKIE)?.strip_prefix('=')?.trim();
 
-    (!pair.is_empty()).then(|| pair.to_owned())
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Maps a transport failure (no connection, timeout, malformed answer) onto a message.
@@ -261,3 +277,7 @@ struct MarkBody {
 struct FailureBody {
     error: String,
 }
+
+/// The tests, in a file of their own: `api/tests.rs`, compiled only for test builds.
+#[cfg(test)]
+mod tests;

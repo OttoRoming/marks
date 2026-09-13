@@ -118,17 +118,6 @@ impl IconCache {
         self.entries.insert(mark_id.to_owned(), state);
     }
 
-    /// Whether `mark_id`'s favicon has arrived and been uploaded as a texture.
-    ///
-    /// Only the tests need to ask: the window learns this by drawing the row.
-    ///
-    /// A query rather than a lookup through [`IconCache::icon`], which would queue a download
-    /// as a side effect: the tests use this to wait for one to finish.
-    #[cfg(test)]
-    pub fn is_ready(&self, mark_id: &str) -> bool {
-        matches!(self.entries.get(mark_id), Some(IconState::Ready(_)))
-    }
-
     /// Drops a deleted mark's favicon, so a long session does not accumulate them.
     pub fn forget(&mut self, mark_id: &str) {
         self.entries.remove(mark_id);

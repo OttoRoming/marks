@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dirs = "7.0.0"
 eframe = "0.35.0"
+# Skim's matcher, and the reason it is this one: as well as whether a pattern matched, it says
+# *where* it matched, and the window picks those characters out in the row it found. A matcher
+# that only scored a match would leave the highlighting to be worked out a second time, by
+# something that could disagree with it.
+fuzzy-matcher = "0.3.7"
 # Only the decoders for the formats the server can serve are enabled: `sniffImageType`
 # recognises these five formats and nothing else can come back from /api/marks/<id>/icon.
 image = { version = "0.25.10", default-features = false, features = [
@@ -16,5 +22,9 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+toml = "1.1.6"
 ureq = { version = "3.4.1", features = ["json"] }
 url = "2.5.8"
+
+[dev-dependencies]
+ab_glyph = "0.2.32"

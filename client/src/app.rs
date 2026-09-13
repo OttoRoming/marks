@@ -5,8 +5,12 @@ use std::thread;
 use eframe::egui;
 
 use crate::api::{Api, ApiError};
+use crate::config::{self, Config, MAX_SIDE, MIN_HEIGHT, MIN_WIDTH};
+use crate::fonts;
 use crate::icons::{IconCache, IconState};
 use crate::mark::{Mark, web_link};
+use crate::search;
+use crate::session_file;
 use crate::title::fetch_title;
 
 /// Where the client looks for the server unless `MARKS_URL` says otherwise: the SvelteKit dev
@@ -97,6 +101,7 @@ struct Keys {
     up: bool,
     down: bool,
     remove: bool,
+    config: bool,
     close: bool,
 }
 
@@ -119,29 +124,39 @@ pub struct MarksApp {
     query: String,
     selected: usize,
 
+    /// The settings the window is running by, and where they are kept.
+    config: Config,
+    /// Whether the configuration panel is up.
+    config_open: bool,
+
     auth: AuthForm,
     notice: Option<Notice>,
 }
 
 impl MarksApp {
     /// Builds the app for `ctx`, which the favicon pool needs a handle to.
+    /// Builds the app for `ctx`, with the settings to run by, the server to talk to, and the
+    /// session to start from handed in.
     ///
-    /// Taking a context rather than an [`eframe::CreationContext`] is what lets the tests at
-    /// the bottom of this file run real frames without eframe.
-    pub fn new(ctx: &egui::Context) -> Self {
-        let base_url = std::env::var("MARKS_URL")
-            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
-            .trim_end_matches('/')
-            .to_owned();
+    /// Taking those rather than reading them is what lets the environment and the files on disk
+    /// stay out of here: `main` reads them ([`starting_session`] and `Config::load`), and a test
+    /// can build a window without a session file, a `MARKS_URL`, or anything else off the
+    /// machine.
+    ///
+    /// Taking a context rather than an [`eframe::CreationContext`] is what lets the tests run
+    /// real frames without eframe.
+    pub fn new(
+        ctx: &egui::Context,
+        base_url: String,
+        token: Option<String>,
+        config: Config,
+    ) -> Self {
+        // Before anything is drawn: the fonts are what everything after this is drawn with.
+        fonts::install(ctx, &config.fonts.priority);
 
-        // A token can be handed in, which starts the client signed in without the dialog. The
-        // session still lives in memory only: `MARKS_TOKEN` is how a session that exists
-        // elsewhere (a browser, a script) is reused here.
-        let handed_in = std::env::var("MARKS_TOKEN")
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty())
-            .map(|token| Arc::new(Api::with_token(base_url.clone(), &token)));
+        // A session to start from means the window opens signed in, so closing it and opening
+        // it again does not ask for the password a second time.
+        let start = token.map(|token| Arc::new(Api::with_token(base_url.clone(), &token)));
 
         let (events_tx, events_rx) = mpsc::channel();
 
@@ -149,14 +164,16 @@ impl MarksApp {
             base_url,
             events_tx,
             events_rx,
-            api: handed_in,
+            api: start,
             username: None,
             icons: None,
             marks: Vec::new(),
             query: String::new(),
             selected: 0,
-            // The session lives in memory only, so the first thing the app shows is normally
-            // the sign-in dialog, with the caret already in the username field.
+            config,
+            config_open: false,
+            // Without a session to start from, the first thing the app shows is the sign-in
+            // dialog, with the caret already in the username field.
             auth: AuthForm {
                 focus_username: true,
                 ..Default::default()
@@ -299,17 +316,26 @@ impl MarksApp {
 
         let base = self.base_url.clone();
         self.spawn(ctx, move || {
-            let mut api = Api::new(base);
+            let mut api = Api::new(base.clone());
             let attempt = match mode {
                 AuthMode::Login => api.login(&username, &password),
                 AuthMode::Signup => api.signup(&username, &password),
             };
 
             match attempt {
-                Ok(()) => Event::SignedIn {
-                    api: Arc::new(api),
-                    username,
-                },
+                Ok(()) => {
+                    // The server has just issued this session, so this is the one place that
+                    // knows a token worth keeping. Written here, on the worker, because the
+                    // file is not the UI thread's business.
+                    if let Some(token) = api.token() {
+                        session_file::save(&base, token);
+                    }
+
+                    Event::SignedIn {
+                        api: Arc::new(api),
+                        username,
+                    }
+                }
                 Err(error) => Event::SignInFailed(error.to_string()),
             }
         });
@@ -317,11 +343,20 @@ impl MarksApp {
 
     /// Drops the session and puts the sign-in dialog back up.
     fn signed_out(&mut self, reason: &str) {
+        // The token the server has just refused is not worth keeping on disk either — and only
+        // that one, so a session handed in through the environment being refused leaves a good
+        // stored session for the same server alone.
+        if let Some(token) = self.api.as_ref().and_then(|api| api.token()) {
+            session_file::forget(&self.base_url, token);
+        }
+
         self.api = None;
         self.icons = None;
         self.username = None;
         self.marks.clear();
         self.selected = 0;
+        // The sign-in dialog takes the window back, so the panel has no business being up.
+        self.config_open = false;
         self.auth = AuthForm {
             error: Some(reason.to_owned()),
             focus_username: true,
@@ -423,11 +458,17 @@ impl MarksApp {
             // Ctrl+D rather than Delete: the search field has the keyboard, and there Delete
             // and Backspace belong to the text being edited.
             remove: input.consume_key(egui::Modifiers::CTRL, egui::Key::D),
+            // Ctrl+, is what every program puts its settings behind.
+            config: input.consume_key(egui::Modifiers::CTRL, egui::Key::Comma),
             close: input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
         });
 
         if keys.close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if keys.config {
+            self.config_open = true;
             return;
         }
         if keys.up {
@@ -444,6 +485,23 @@ impl MarksApp {
         }
         if keys.open {
             self.open_selected(ctx);
+        }
+    }
+
+    /// Keys that matter while the configuration panel is up: either of them closes it.
+    ///
+    /// Escape closes the panel rather than the window here, because while the panel is up that
+    /// is the thing the user is looking at.
+    fn config_keys(&mut self, ctx: &egui::Context) {
+        let (toggle, escape) = ctx.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::CTRL, egui::Key::Comma),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        });
+
+        if toggle || escape {
+            self.config_open = false;
         }
     }
 
@@ -548,9 +606,9 @@ impl MarksApp {
                 .desired_width(f32::INFINITY),
         );
 
-        // A launcher has nothing else to click, so the caret lives here — except while the
-        // sign-in dialog is up, where its own fields want it.
-        if self.api.is_some() && !response.has_focus() {
+        // A launcher has nothing else to click, so the caret lives here — except while a dialog
+        // is up, where the fields in it want the caret instead.
+        if self.api.is_some() && !self.config_open && !response.has_focus() {
             response.request_focus();
         }
     }
@@ -579,7 +637,7 @@ impl MarksApp {
                                 None => IconState::Missing,
                             };
 
-                            if mark_row(ui, &icon, mark, index == self.selected).clicked() {
+                            if mark_row(ui, &icon, mark, &self.query, index == self.selected).clicked() {
                                 activated = Some(index);
                             }
                         }
@@ -645,8 +703,184 @@ impl MarksApp {
                 ui.separator();
             }
 
-            ui.weak("↑↓ move   Enter open   Ctrl+D delete   Esc close");
+            ui.weak("↑↓ move   Enter open   Ctrl+D delete   Ctrl+, settings   Esc close");
         });
+    }
+
+    /// The configuration panel (Ctrl+,): what the window is allowed to be, and what it draws with.
+    ///
+    /// Everything it changes takes effect at once, on the window that is open, so that a size
+    /// or a font can be tried rather than imagined; what the panel settles on is written to the
+    /// settings file as it is settled.
+    fn config_panel(&mut self, ctx: &egui::Context) {
+        // Gathered while the panel is drawn and acted on after it, because the panel is reading
+        // from `self` while these would be changing it.
+        let mut fixed_size = None;
+        // The window should follow the numbers as they are dragged...
+        let mut apply = false;
+        // ...and the file is written once the edit is over, rather than once per frame of a drag.
+        let mut keep = false;
+        // A font moving up or down the list, worked out as the list is drawn.
+        let mut moved = None;
+
+        egui::Modal::new(egui::Id::new("configuration")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("Configuration");
+            ui.add_space(10.0);
+
+            ui.strong("Window");
+            ui.add_space(4.0);
+
+            let mut fixed = self.config.window.fixed_size;
+            if ui
+                .checkbox(&mut fixed, "Keep the window at one size")
+                .on_hover_text("A window that is not fixed can be resized as usual")
+                .changed()
+            {
+                fixed_size = Some(fixed);
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Opens at");
+                let width = ui.add(
+                    egui::DragValue::new(&mut self.config.window.width)
+                        .range(MIN_WIDTH..=MAX_SIDE)
+                        .suffix(" px"),
+                );
+                ui.label("x");
+                let height = ui.add(
+                    egui::DragValue::new(&mut self.config.window.height)
+                        .range(MIN_HEIGHT..=MAX_SIDE)
+                        .suffix(" px"),
+                );
+
+                apply = width.changed() || height.changed();
+                keep = edit_finished(&width) || edit_finished(&height);
+            });
+
+            ui.weak(if self.config.window.fixed_size {
+                "The window stays at this size."
+            } else {
+                "The window opens at this size, and can be resized after."
+            });
+
+            ui.add_space(12.0);
+            ui.strong("Fonts");
+            ui.add_space(4.0);
+            ui.weak("The first font that has a character is the one that draws it.");
+
+            // A copy, because the list is being read while a move is being decided on.
+            let priority = self.config.fonts.priority.clone();
+            let last = priority.len().saturating_sub(1);
+
+            for (index, name) in priority.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if index == 0 {
+                        ui.strong(name);
+                    } else {
+                        ui.label(name);
+                    }
+
+                    // Buttons right-aligned, with the pair of them the same width whether or
+                    // not one is disabled.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(index < last, egui::Button::new("Down"))
+                            .clicked()
+                        {
+                            moved = Some((index, 1));
+                        }
+                        if ui
+                            .add_enabled(index > 0, egui::Button::new("Up"))
+                            .clicked()
+                        {
+                            moved = Some((index, -1));
+                        }
+                    });
+                });
+            }
+
+            ui.add_space(12.0);
+            ui.weak(match self.config.path() {
+                Some(path) => format!("Settings are kept in {}", path.display()),
+                None => "This system has no config directory to keep settings in.".to_owned(),
+            });
+            ui.add_space(4.0);
+            ui.weak("Ctrl+, or Esc closes this panel");
+        });
+
+        // One decision, applied and written in the same breath; then the size, which is applied
+        // as it moves and written when it settles.
+        if let Some((index, delta)) = moved {
+            self.move_font(ctx, index, delta);
+        } else if let Some(fixed) = fixed_size {
+            self.set_fixed_size(ctx, fixed);
+        } else if keep {
+            self.settle_window(ctx);
+        } else if apply {
+            self.config.window.clamp();
+            self.apply_window_settings(ctx);
+        }
+    }
+
+    /// Moves the font at `index` one place up or down the priority, and writes the order down.
+    fn move_font(&mut self, ctx: &egui::Context, index: usize, delta: isize) {
+        let priority = &mut self.config.fonts.priority;
+        let Some(target) = index
+            .checked_add_signed(delta)
+            .filter(|target| *target < priority.len())
+        else {
+            // Off either end of the list, which the buttons do not offer but a call could ask.
+            return;
+        };
+
+        priority.swap(index, target);
+
+        self.settle_fonts(ctx);
+    }
+
+    /// Puts the fonts onto the window that is open, and the order on disk.
+    fn settle_fonts(&mut self, ctx: &egui::Context) {
+        self.config.fonts.settle();
+        fonts::install(ctx, &self.config.fonts.priority);
+        self.config.save();
+    }
+
+    /// Keeps the window at one size, or frees it again, and writes the choice down.
+    fn set_fixed_size(&mut self, ctx: &egui::Context, fixed: bool) {
+        self.config.window.fixed_size = fixed;
+        self.settle_window(ctx);
+    }
+
+    /// Brings the window in line with the settings, and the settings in line with the disk.
+    ///
+    /// What the panel calls once an edit is over: the numbers themselves are edited in place,
+    /// so this is where they are brought within reach, put on the window, and written down.
+    fn settle_window(&mut self, ctx: &egui::Context) {
+        self.config.window.clamp();
+        self.apply_window_settings(ctx);
+        self.config.save();
+    }
+
+    /// Puts the settings onto the window that is already open.
+    ///
+    /// The same three things the window was opened with (see `Window::viewport`), sent again
+    /// because a window that is up is told what to be rather than rebuilt.
+    fn apply_window_settings(&self, ctx: &egui::Context) {
+        let window = &self.config.window;
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!window.fixed_size));
+        // A window held at one size is held at exactly that; one that can be resized is held to
+        // the floor the list needs.
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+            if window.fixed_size {
+                window.size()
+            } else {
+                config::floor()
+            },
+        ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(window.size()));
     }
 
     /// Draws one frame of the window.
@@ -659,10 +893,13 @@ impl MarksApp {
         self.drain_events(&ctx);
 
         // While the sign-in dialog is up there is no list to drive, so the launcher keys are
-        // left alone: Enter belongs to the form.
+        // left alone: Enter belongs to the form. The configuration panel is the same, and takes
+        // the keyboard while it is up.
         let mut sign_in = None;
         if self.api.is_none() {
             sign_in = self.modal_keys(&ctx);
+        } else if self.config_open {
+            self.config_keys(&ctx);
         } else {
             self.launcher_keys(&ctx);
         }
@@ -686,6 +923,8 @@ impl MarksApp {
             if let Some(mode) = sign_in {
                 self.authenticate(&ctx, mode);
             }
+        } else if self.config_open {
+            self.config_panel(&ctx);
         }
     }
 }
@@ -697,7 +936,16 @@ impl eframe::App for MarksApp {
 }
 
 /// Draws one row: its favicon, its name, and the link underneath.
-fn mark_row(ui: &mut egui::Ui, icon: &IconState, mark: &Mark, selected: bool) -> egui::Response {
+///
+/// `query` is what is in the search box: the characters it found in either line are drawn
+/// brighter than the rest of it, so a row that a fuzzy match put here says why it is here.
+fn mark_row(
+    ui: &mut egui::Ui,
+    icon: &IconState,
+    mark: &Mark,
+    query: &str,
+    selected: bool,
+) -> egui::Response {
     let background = if selected {
         ui.visuals().selection.bg_fill
     } else {
@@ -714,14 +962,76 @@ fn mark_row(ui: &mut egui::Ui, icon: &IconState, mark: &Mark, selected: bool) ->
             ui.horizontal(|ui| {
                 icon_widget(ui, icon);
                 ui.vertical(|ui| {
-                    ui.strong(&mark.name);
-                    ui.weak(egui::RichText::new(&mark.content).small().monospace());
+                    let name = ui.visuals().strong_text_color();
+                    ui.label(highlighted(ui, &mark.name, query, egui::TextStyle::Body, name));
+
+                    let link = ui.visuals().weak_text_color();
+                    ui.label(highlighted(
+                        ui,
+                        &mark.content,
+                        query,
+                        egui::TextStyle::Monospace,
+                        link,
+                    ));
                 });
             });
         })
         .response
         // The row is clicked as a whole, so the pointer does not have to find the text.
         .interact(egui::Sense::click())
+}
+
+/// A line of text with the characters the query matched picked out of it.
+///
+/// Those characters are drawn in the window's strong colour and the rest of the line dimmed
+/// around them — but only when the query found something here. A line nothing was matched in,
+/// and every line while the search box is empty, is drawn in `plain` from end to end, so a row
+/// with no query in play looks exactly as it always did.
+fn highlighted(
+    ui: &egui::Ui,
+    text: &str,
+    query: &str,
+    style: egui::TextStyle,
+    plain: egui::Color32,
+) -> egui::text::LayoutJob {
+    let font = style.resolve(ui.style());
+    let hits = search::find(text, query)
+        .map(|found| found.indices)
+        .unwrap_or_default();
+
+    let (plain, matched) = if hits.is_empty() {
+        (plain, plain)
+    } else {
+        (ui.visuals().weak_text_color(), ui.visuals().strong_text_color())
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut cursor = 0;
+
+    for &hit in &hits {
+        if hit > cursor {
+            job.append(&text[cursor..hit], 0.0, stretch(plain, font.clone()));
+        }
+
+        let end = hit + text[hit..].chars().next().map_or(0, char::len_utf8);
+        job.append(&text[hit..end], 0.0, stretch(matched, font.clone()));
+        cursor = end;
+    }
+
+    if cursor < text.len() {
+        job.append(&text[cursor..], 0.0, stretch(plain, font));
+    }
+
+    job
+}
+
+/// One stretch of a line, in one colour and one font.
+fn stretch(color: egui::Color32, font: egui::FontId) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: font,
+        color,
+        ..Default::default()
+    }
 }
 
 /// Draws the favicon slot: the icon, a spinner while it is on its way, or nothing.
@@ -749,21 +1059,78 @@ fn icon_widget(ui: &mut egui::Ui, icon: &IconState) {
     }
 }
 
-/// The marks the query keeps, in the order the list draws them.
+/// The session token handed in through the environment, when there is one.
+///
+/// `MARKS_TOKEN` is how a session that exists elsewhere — a browser, a script, another window
+/// — is reused here without signing in again.
+fn handed_in_token() -> Option<String> {
+    std::env::var("MARKS_TOKEN")
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+}
+
+/// The server to talk to, and the session to start from, from the environment and from the
+/// session kept on disk.
+///
+/// `MARKS_URL` names the server, and `MARKS_TOKEN` hands in a session directly. With none
+/// handed in, the session the last run kept is used. The environment wins, because a session
+/// handed in was asked for on purpose and a stale one on disk should not overrule it.
+///
+/// Called by `main` only: everything here reads something off the machine, which is exactly
+/// what a test should not be doing.
+pub fn starting_session() -> (String, Option<String>) {
+    let base_url = std::env::var("MARKS_URL")
+        .unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned())
+        .trim_end_matches('/')
+        .to_owned();
+
+    let token = handed_in_token().or_else(|| session_file::load(&base_url));
+
+    (base_url, token)
+}
+
+/// Whether an edit to a number is over, so that what it left can be written down.
+///
+/// A number being dragged reports a change on every frame of the drag, and a settings file is
+/// not worth writing sixty times a second for one of them; a value that is typed or stepped is
+/// over as soon as it changes.
+fn edit_finished(response: &egui::Response) -> bool {
+    response.drag_stopped() || response.lost_focus() || (response.changed() && !response.dragged())
+}
+
+/// The marks the query keeps, the best answer to it first.
 ///
 /// A free function rather than a method so that the borrow it takes is limited to `marks`:
 /// drawing the rows needs `self.icons` mutably while this list is still alive.
 fn filter_marks<'a>(marks: &'a [Mark], query: &str) -> Vec<&'a Mark> {
-    let needle = query.trim().to_lowercase();
-
-    marks
+    let mut found: Vec<(i64, &Mark)> = marks
         .iter()
-        .filter(|mark| {
-            needle.is_empty()
-                || mark.name.to_lowercase().contains(&needle)
-                || mark.content.to_lowercase().contains(&needle)
-        })
-        .collect()
+        .filter_map(|mark| score(mark, query).map(|score| (score, mark)))
+        .collect();
+
+    // Best first. The sort is stable, so anything the matcher scored the same keeps the order it
+    // arrived in — which is every mark while the search box is empty, and so the list is left
+    // exactly as the server sent it until there is something to rank.
+    found.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+
+    found.into_iter().map(|(_, mark)| mark).collect()
+}
+
+/// How well `mark` answers the query, or `None` when neither its name nor its link does.
+///
+/// The better of the two: a mark found by its name and one found by the page it points at are
+/// both answers to the query, and which of them answers it better is what the matcher's score
+/// says. Typing "you" scores the YouTube mark's name far above a news link whose address happens
+/// to carry a y, an o and a u across three different words.
+fn score(mark: &Mark, query: &str) -> Option<i64> {
+    let name = search::find(&mark.name, query).map(|found| found.score);
+    let link = search::find(&mark.content, query).map(|found| found.score);
+
+    match (name, link) {
+        (Some(name), Some(link)) => Some(name.max(link)),
+        (name, link) => name.or(link),
+    }
 }
 
 /// The mark the selection points at, if the filter still leaves one there.
@@ -831,429 +1198,6 @@ fn shorten(text: &str, max: usize) -> String {
     shortened
 }
 
+/// The tests, in a file of their own: `app/tests.rs`, compiled only for test builds.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// The account the live tests use: created on the first run, reused after that.
-    const TEST_USER: &str = "client-test";
-    const TEST_PASSWORD: &str = "client-test-password";
-
-    /// How long a live request may take before a test calls it a failure.
-    const TIMEOUT: Duration = Duration::from_secs(20);
-
-    fn mark(name: &str, content: &str) -> Mark {
-        Mark {
-            id: name.to_lowercase(),
-            name: name.to_owned(),
-            content: content.to_owned(),
-            icon_id: None,
-        }
-    }
-
-    fn names(marks: &[&Mark]) -> Vec<String> {
-        marks.iter().map(|mark| mark.name.clone()).collect()
-    }
-
-    /// Runs one frame of the whole app with `events` as this frame's input.
-    fn frame(app: &mut MarksApp, ctx: &egui::Context, events: Vec<egui::Event>) {
-        let input = egui::RawInput {
-            events,
-            ..Default::default()
-        };
-        // The frame's output (textures, shapes) is not what these tests look at.
-        let _ = ctx.run_ui(input, |ui| app.show(ui));
-    }
-
-    /// Runs frames until `done` holds, and reports whether it ever did.
-    fn frame_until(
-        app: &mut MarksApp,
-        ctx: &egui::Context,
-        done: impl Fn(&MarksApp) -> bool,
-    ) -> bool {
-        let deadline = Instant::now() + TIMEOUT;
-
-        loop {
-            frame(app, ctx, Vec::new());
-            if done(app) {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
-        egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers,
-        }
-    }
-
-    /// A client signed in as the test account, for putting fixtures on the server. The test
-    /// account is created the first time this ever runs.
-    fn test_api() -> Api {
-        let mut api = Api::new(DEFAULT_BASE_URL);
-        if api.login(TEST_USER, TEST_PASSWORD).is_err() {
-            api = Api::new(DEFAULT_BASE_URL);
-            api.signup(TEST_USER, TEST_PASSWORD)
-                .expect("could not create the test account");
-        }
-
-        api
-    }
-
-    /// Signs in through the app's own dialog, creating the test account the first time.
-    fn sign_in(app: &mut MarksApp, ctx: &egui::Context) {
-        app.auth.username = TEST_USER.to_owned();
-        app.auth.password = TEST_PASSWORD.to_owned();
-
-        app.authenticate(ctx, AuthMode::Login);
-        if !frame_until(app, ctx, |app| app.api.is_some()) {
-            app.authenticate(ctx, AuthMode::Signup);
-            assert!(
-                frame_until(app, ctx, |app| app.api.is_some()),
-                "could not sign in or sign up: {:?}",
-                app.auth.error
-            );
-        }
-
-        // A frame or two so the search field can take the caret before anything is typed.
-        frame(app, ctx, Vec::new());
-        frame(app, ctx, Vec::new());
-    }
-
-    #[test]
-    fn the_query_keeps_the_marks_it_matches() {
-        let marks = vec![
-            mark("GitHub", "https://github.com/emilk/egui"),
-            mark("Svelte", "https://svelte.dev/docs/kit"),
-        ];
-
-        assert_eq!(names(&filter_marks(&marks, "")), ["GitHub", "Svelte"]);
-        assert_eq!(names(&filter_marks(&marks, "hub")), ["GitHub"]);
-        // The query is matched against the link as well as the name, and case does not matter.
-        assert_eq!(names(&filter_marks(&marks, "SVELTE.DEV")), ["Svelte"]);
-        assert!(filter_marks(&marks, "nothing here").is_empty());
-    }
-
-    #[test]
-    fn a_typed_link_is_stored_as_one_and_named_after_its_host() {
-        assert_eq!(stored_content("example.com"), "https://example.com/");
-        assert_eq!(mark_name("https://example.com/some/page"), "example.com");
-
-        // A note keeps the text it was typed as, and is not a link.
-        assert_eq!(stored_content("buy milk"), "buy milk");
-        assert_eq!(mark_name("buy milk"), "buy milk");
-        assert!(web_link("buy milk").is_none());
-    }
-
-    #[test]
-    fn a_note_is_named_after_its_text_and_is_never_fetched() {
-        // Nothing off the machine is asked for a name when there is no page to ask: the
-        // fallback is the answer, and typing a note stays as quick as it ever was.
-        let content = "buy milk";
-
-        assert_eq!(named_after_title(content, mark_name(content)), "buy milk");
-    }
-
-    #[test]
-    fn a_link_that_cannot_be_reached_keeps_its_host_name() {
-        // Port 1 on loopback refuses immediately, so this is an offline test that still goes
-        // through the real fetch: the failure leaves the host name it would have had.
-        let content = "http://127.0.0.1:1/";
-
-        assert_eq!(named_after_title(content, mark_name(content)), "127.0.0.1");
-    }
-
-    #[test]
-    fn the_ctrl_enter_hint_is_only_there_when_there_is_something_to_save() {
-        let ctx = egui::Context::default();
-        let mut app = MarksApp::new(&ctx);
-
-        assert_eq!(app.save_hint(), None);
-
-        app.query = "  example.com  ".to_owned();
-        let hint = app.save_hint().expect("a hint while something is typed");
-        assert!(hint.contains("Ctrl+Enter"), "{hint}");
-        assert!(hint.contains("example.com"), "{hint}");
-    }
-
-    #[test]
-    fn a_hint_repeats_the_query_until_it_is_too_long() {
-        assert_eq!(shorten("example.com", HINT_CHARS), "example.com");
-        assert_eq!(shorten("exactly-ten", 11), "exactly-ten");
-
-        let cut = shorten(&"x".repeat(100), 10);
-        assert_eq!(cut.chars().count(), 11);
-        assert!(cut.ends_with('…'));
-    }
-
-    #[test]
-    #[ignore = "needs internet access"]
-    fn a_link_is_named_after_the_title_of_the_page_it_points_at() {
-        // example.com is reserved for documentation and has answered with the same title for
-        // decades, which makes it the one title worth writing down in a test.
-        let content = "https://example.com/";
-
-        assert_eq!(
-            named_after_title(content, mark_name(content)),
-            "Example Domain"
-        );
-    }
-
-    #[test]
-    #[ignore = "needs a running dev server"]
-    fn ctrl_enter_names_a_new_link_after_the_title_of_its_page() {
-        // The page is served from this machine, so the title that comes back is one this test
-        // wrote rather than whatever the internet has to say today. The marks server is the
-        // real one, so this covers the whole path: typed text, fetched title, stored name.
-        let page = crate::title::serve(
-            "text/html",
-            "<html><head><title>Local Test Page</title></head><body>hello</body></html>",
-        );
-
-        let ctx = egui::Context::default();
-        let mut app = MarksApp::new(&ctx);
-        sign_in(&mut app, &ctx);
-
-        assert!(
-            frame_until(&mut app, &ctx, |app| app.api.is_some()),
-            "not signed in"
-        );
-
-        frame(
-            &mut app,
-            &ctx,
-            vec![egui::Event::Text(page.as_str().to_owned())],
-        );
-        frame(&mut app, &ctx, Vec::new());
-        assert_eq!(app.query, page.as_str(), "typing did not reach the field");
-
-        frame(
-            &mut app,
-            &ctx,
-            vec![press(egui::Key::Enter, egui::Modifiers::CTRL)],
-        );
-
-        assert!(
-            frame_until(&mut app, &ctx, |app| app
-                .marks
-                .iter()
-                .any(|mark| mark.name == "Local Test Page")),
-            "the mark was not named after its page: {:?}",
-            app.notice.as_ref().map(|notice| notice.text.clone())
-        );
-
-        // The name is the client's; what the server stored is what matters, so ask it.
-        let saved = app
-            .marks
-            .iter()
-            .find(|mark| mark.name == "Local Test Page")
-            .cloned()
-            .expect("the new mark");
-        let api = app.api.clone().expect("signed in");
-        let stored = api.list_marks().expect("the server list");
-        let on_server = stored
-            .iter()
-            .find(|mark| mark.id == saved.id)
-            .expect("the server never stored the mark");
-        assert_eq!(on_server.name, "Local Test Page");
-        assert_eq!(on_server.content, page.as_str());
-
-        api.delete_mark(&saved.id).expect("clean up");
-    }
-
-    #[test]
-    #[ignore = "needs a running dev server"]
-    fn typing_filters_the_list() {
-        let api = test_api();
-        let stamp = std::process::id();
-        let alpha = api
-            .create_mark(&format!("alpha-{stamp}"), "alpha note")
-            .expect("a first mark");
-        let beta = api
-            .create_mark(&format!("beta-{stamp}"), "beta note")
-            .expect("a second mark");
-
-        // The list is loaded when the session starts, so the fixtures go up first.
-        let ctx = egui::Context::default();
-        let mut app = MarksApp::new(&ctx);
-        sign_in(&mut app, &ctx);
-
-        assert!(
-            frame_until(&mut app, &ctx, |app| {
-                app.marks.iter().any(|mark| mark.id == alpha.id)
-                    && app.marks.iter().any(|mark| mark.id == beta.id)
-            }),
-            "the mark list never arrived"
-        );
-
-        // Typing goes through the real text field.
-        frame(&mut app, &ctx, vec![egui::Event::Text(format!("alpha-{stamp}"))]);
-        frame(&mut app, &ctx, Vec::new());
-
-        assert_eq!(app.query, format!("alpha-{stamp}"));
-        let shown = filter_marks(&app.marks, &app.query);
-        assert_eq!(names(&shown), [format!("alpha-{stamp}")]);
-
-        api.delete_mark(&alpha.id).expect("clean up");
-        api.delete_mark(&beta.id).expect("clean up");
-    }
-
-    #[test]
-    #[ignore = "needs a running dev server"]
-    fn ctrl_enter_saves_what_is_typed_and_ctrl_d_removes_it() {
-        let ctx = egui::Context::default();
-        let mut app = MarksApp::new(&ctx);
-        sign_in(&mut app, &ctx);
-
-        assert!(
-            frame_until(&mut app, &ctx, |app| app.api.is_some()),
-            "not signed in"
-        );
-
-        frame(&mut app, &ctx, vec![egui::Event::Text("example.com".to_owned())]);
-        frame(&mut app, &ctx, Vec::new());
-        assert_eq!(app.query, "example.com", "typing did not reach the field");
-
-        frame(&mut app, &ctx, vec![press(egui::Key::Enter, egui::Modifiers::CTRL)]);
-        assert!(
-            frame_until(&mut app, &ctx, |app| {
-                app.query.is_empty()
-                    && app
-                        .marks
-                        .iter()
-                        .any(|mark| mark.content.starts_with("https://example.com"))
-            }),
-            "Ctrl+Enter did not save the typed link: {:?}",
-            app.notice.as_ref().map(|notice| notice.text.clone())
-        );
-
-        let saved = app
-            .marks
-            .iter()
-            .find(|mark| mark.content.starts_with("https://example.com"))
-            .cloned()
-            .expect("the new mark");
-
-        // The page names itself when its title could be fetched, which is the usual case for a
-        // live test; a machine that cannot reach it keeps the host it was named after. Either
-        // way the save went through, which is what this test is about.
-        assert!(
-            matches!(saved.name.as_str(), "Example Domain" | "example.com"),
-            "unexpected name {:?}",
-            saved.name
-        );
-
-        let api = app.api.clone().expect("signed in");
-        assert!(
-            api.list_marks()
-                .expect("the server list")
-                .iter()
-                .any(|mark| mark.id == saved.id),
-            "the server never stored the mark"
-        );
-
-        // The mark that was just saved is the selected one, so Ctrl+D removes it again.
-        assert_eq!(
-            selected_mark(&app.marks, &app.query, app.selected).map(|mark| mark.id.clone()),
-            Some(saved.id.clone()),
-            "the new mark should be the selected row"
-        );
-
-        frame(&mut app, &ctx, vec![press(egui::Key::D, egui::Modifiers::CTRL)]);
-        assert!(
-            frame_until(&mut app, &ctx, |app| {
-                !app.marks.iter().any(|mark| mark.id == saved.id)
-            }),
-            "Ctrl+D did not delete the mark"
-        );
-        assert!(
-            !api.list_marks()
-                .expect("the server list")
-                .iter()
-                .any(|mark| mark.id == saved.id),
-            "the server still has the mark"
-        );
-    }
-
-    #[test]
-    #[ignore = "needs a running dev server"]
-    fn a_favicon_is_fetched_decoded_and_uploaded() {
-        let api = test_api();
-        let stamp = std::process::id();
-        let linked = api
-            .create_mark(&format!("github-{stamp}"), "https://github.com/emilk/egui")
-            .expect("a mark");
-        assert!(
-            linked.icon_id.is_some(),
-            "the server stored no favicon for github.com"
-        );
-
-        let ctx = egui::Context::default();
-        let mut app = MarksApp::new(&ctx);
-        sign_in(&mut app, &ctx);
-
-        // Drawing the row is what queues the download, so the frames do the work.
-        assert!(
-            frame_until(&mut app, &ctx, |app| app
-                .marks
-                .iter()
-                .any(|mark| mark.id == linked.id)),
-            "the mark never arrived"
-        );
-        assert!(
-            frame_until(&mut app, &ctx, |app| app
-                .icons
-                .as_ref()
-                .is_some_and(|icons| icons.is_ready(&linked.id))),
-            "the favicon never became a texture"
-        );
-
-        api.delete_mark(&linked.id).expect("clean up");
-    }
-
-    #[test]
-    #[ignore = "needs a running dev server"]
-    fn the_arrows_move_the_selection_and_enter_leaves_a_note_alone() {
-        let api = test_api();
-        let stamp = std::process::id();
-        let note = api
-            .create_mark(&format!("note-{stamp}"), "just a note")
-            .expect("a note");
-
-        let ctx = egui::Context::default();
-        let mut app = MarksApp::new(&ctx);
-        sign_in(&mut app, &ctx);
-
-        assert!(
-            frame_until(&mut app, &ctx, |app| app.marks
-                .iter()
-                .any(|mark| mark.id == note.id)),
-            "the note never arrived"
-        );
-
-        app.query = format!("note-{stamp}");
-        frame(&mut app, &ctx, Vec::new());
-
-        let before = app.selected;
-        frame(&mut app, &ctx, vec![press(egui::Key::ArrowDown, egui::Modifiers::NONE)]);
-        assert_eq!(app.selected, before.min(filter_marks(&app.marks, &app.query).len() - 1));
-
-        // Enter on a note must complain rather than try to open anything.
-        frame(&mut app, &ctx, vec![press(egui::Key::Enter, egui::Modifiers::NONE)]);
-        assert!(
-            app.notice.as_ref().is_some_and(|notice| notice.error),
-            "Enter on a note should report that it is not a link"
-        );
-
-        api.delete_mark(&note.id).expect("clean up");
-    }
-}
+mod tests;
