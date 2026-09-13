@@ -27,7 +27,7 @@ export const icon = sqliteTable('icon', {
 		.primaryKey()
 		.$defaultFn(() => crypto.randomUUID()),
 	type: text({ enum: ['favicon'] }).notNull(),
-	url: text('url'),
+	url: text('url').notNull().unique(),
 	content: blob({ mode: 'buffer' })
 });
 

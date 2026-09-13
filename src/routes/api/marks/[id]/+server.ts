@@ -5,7 +5,12 @@ import { mark } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
 import { parseJsonBody } from '$lib/server/validation';
 import { fetchFavicon } from '$lib/server/favicon';
-import { createIconRow, deleteIconRow, getOwnMark, markSelection } from '$lib/server/marks';
+import {
+	deleteIconRowIfUnreferenced,
+	getOrCreateIconRow,
+	getOwnMark,
+	markSelection
+} from '$lib/server/marks';
 import { markUpdateSchema } from '$lib/schemas/mark';
 
 function not_found() {
@@ -51,7 +56,7 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 	const favicon = content_changed ? await fetchFavicon(content) : null;
 	const icon_id = content_changed
 		? favicon
-			? await createIconRow(favicon)
+			? await getOrCreateIconRow(favicon)
 			: null
 		: existing.icon_id;
 
@@ -65,9 +70,10 @@ export const PATCH: RequestHandler = async ({ params, request, locals }) => {
 		.where(eq(mark.id, existing.id))
 		.returning(markSelection);
 
-	// The previous icon row is unreferenced once it has been swapped out.
+	// The previous icon row is left alone when the new content still resolves to it, or when
+	// another mark shares it; it is dropped only once nothing references it any more.
 	if (content_changed) {
-		await deleteIconRow(existing.icon_id);
+		await deleteIconRowIfUnreferenced(existing.icon_id);
 	}
 
 	return json({ mark: updated });
@@ -86,9 +92,9 @@ export const DELETE: RequestHandler = async ({ params, locals }) => {
 
 	await db.delete(mark).where(eq(mark.id, existing.id));
 
-	// Deleting a mark does not touch `icon` (the FK cascade runs the other way), so the
-	// row would otherwise be orphaned.
-	await deleteIconRow(existing.icon_id);
+	// Deleting a mark does not touch `icon` (the FK cascade runs the other way), so the row
+	// would otherwise be orphaned — unless another mark still shares it.
+	await deleteIconRowIfUnreferenced(existing.icon_id);
 
 	return new Response(null, { status: 204 });
 };

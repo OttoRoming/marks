@@ -5,7 +5,7 @@ import { mark } from '$lib/server/db/schema';
 import { db } from '$lib/server/db';
 import { parseJsonBody } from '$lib/server/validation';
 import { fetchFavicon } from '$lib/server/favicon';
-import { createIconRow, markSelection } from '$lib/server/marks';
+import { getOrCreateIconRow, markSelection } from '$lib/server/marks';
 import { markCreateSchema } from '$lib/schemas/mark';
 
 /** Lists the signed-in user's marks. No icon bytes: those come from /api/marks/[id]/icon. */
@@ -39,8 +39,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	const { name, content } = parsed.data;
 
 	// A favicon is a bonus: a null result still creates the mark, just without an icon.
+	// Marks on a hostname already stored share that hostname's icon row.
 	const favicon = await fetchFavicon(content);
-	const icon_id = favicon ? await createIconRow(favicon) : null;
+	const icon_id = favicon ? await getOrCreateIconRow(favicon) : null;
 
 	const [new_mark] = await db
 		.insert(mark)
