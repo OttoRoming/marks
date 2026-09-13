@@ -17,9 +17,18 @@ export const mark = sqliteTable('mark', {
 	user_id: text('user_id')
 		.notNull()
 		.references(() => user.id, { onDelete: 'cascade' }),
+	icon_id: text('icon_id').references(() => icon.id, { onDelete: 'set null' }),
 	name: text('name').notNull(),
-	content: text('content').notNull(),
-	icon: blob()
+	content: text('content').notNull()
+});
+
+export const icon = sqliteTable('icon', {
+	id: text('id')
+		.primaryKey()
+		.$defaultFn(() => crypto.randomUUID()),
+	type: text({ enum: ['favicon'] }).notNull(),
+	url: text('url'),
+	content: blob({ mode: 'buffer' })
 });
 
 export const session = sqliteTable('session', {
