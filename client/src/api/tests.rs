@@ -117,3 +117,35 @@ fn a_rejected_sign_in_keeps_the_servers_own_wording() {
     assert_eq!(error.to_string(), "Incorrect username or password");
     assert_eq!(api.token(), None);
 }
+
+#[test]
+fn a_change_is_a_patch_to_the_mark_it_is_about() {
+    // The mark's id goes in the path, and the session travels with it. Both the name and the content
+    // are sent every time, because the server tells "the content changed" — and so whether to
+    // re-derive the favicon — from what it is sent, rather than from what happens to differ in the
+    // database.
+    let server = serve_answers(vec![
+        signed_in("abc123"),
+        json(
+            r#"{"mark":{"id":"mark-1","name":"New","content":"https://example.com/","icon_id":null}}"#,
+        ),
+    ]);
+
+    let mut api = Api::new(server.url.as_str());
+    api.login("otto", "supersecret").expect("a signed-in client");
+
+    let mark = api
+        .update_mark("mark-1", "New", "https://example.com/")
+        .expect("the mark as the server stored it");
+
+    assert_eq!(mark.id, "mark-1");
+    assert_eq!(mark.name, "New");
+    assert_eq!(mark.content, "https://example.com/");
+
+    let sign_in = request_of(&server);
+    assert!(sign_in.starts_with("post /api/auth/login"), "{sign_in}");
+
+    let change = request_of(&server);
+    assert!(change.starts_with("patch /api/marks/mark-1"), "{change}");
+    assert!(change.contains("cookie: token=abc123"), "{change}");
+}

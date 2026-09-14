@@ -140,6 +140,25 @@ impl Api {
         Ok(read_json::<MarkBody>(&mut response)?.mark)
     }
 
+    /// Changes a mark's name and content, and returns it as the server stored it.
+    ///
+    /// Both are sent every time rather than only what changed: the server re-derives a mark's
+    /// favicon from its content, and tells "the content changed" from what it is sent, so sending
+    /// the same content back is what keeps a renamed mark's favicon.
+    pub fn update_mark(&self, mark_id: &str, name: &str, content: &str) -> ApiResult<Mark> {
+        let mut request = self
+            .agent
+            .patch(self.url(&format!("/api/marks/{mark_id}")))
+            .header("content-type", "application/json");
+        request = self.authorize(request);
+
+        let mut response = request
+            .send_json(json!({ "name": name, "content": content }))
+            .map_err(transport)?;
+
+        Ok(read_json::<MarkBody>(&mut response)?.mark)
+    }
+
     /// Deletes a mark. The server answers 204, so there is nothing to read back.
     pub fn delete_mark(&self, mark_id: &str) -> ApiResult<()> {
         // Mark ids are server-generated UUIDs, so they are safe to place in a path as they are.

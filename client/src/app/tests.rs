@@ -1784,4 +1784,302 @@ fn a_hint_repeats_the_query_until_it_is_too_long() {
     assert!(cut.ends_with('…'));
 }
 
+/// A listing with two marks in it, in the server's order, for the tests that are about one row and
+/// not the other.
+fn marks_with_two() -> (String, String) {
+    (
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n".to_owned(),
+        r#"{"marks":[{"id":"mark-1","name":"Alpha","content":"https://alpha.example/","icon_id":null},{"id":"mark-2","name":"Beta","content":"https://beta.example/","icon_id":null}]}"#
+            .to_owned(),
+    )
+}
+
+/// The answer to a change: the server's own copy of the mark, under the name it was told.
+fn changed_to(mark_id: &str, name: &str, content: &str) -> (String, String) {
+    (
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n".to_owned(),
+        format!(r#"{{"mark":{{"id":"{mark_id}","name":"{name}","content":"{content}","icon_id":null}}}}"#),
+    )
+}
+
+/// The answer to a delete: nothing at all, which is what a 204 is.
+fn deletion_ok() -> (String, String) {
+    ("HTTP/1.1 204 No Content\r\n".to_owned(), String::new())
+}
+
+/// A signed-in window with two marks in it, and the server it is talking to.
+///
+/// The server is handed back because most of what these tests are about is what was sent to it. Any
+/// answers after the listing are handed in by the test that needs them.
+fn two_marked_marks(
+    settings: &Settings,
+    answers: Vec<(String, String)>,
+) -> (MarksApp, egui::Context, test_page::Served) {
+    let mut all = vec![marks_with_two()];
+    all.extend(answers);
+
+    let server = test_page::serve_answers(all);
+    let (mut app, ctx) = window_with(server.url.as_str(), Some("a-session"), settings.config());
+
+    assert!(
+        wait_until(&mut app, &ctx, |app| app.marks.len() == 2),
+        "the listing never arrived"
+    );
+
+    // The listing is taken off the server's record here, so that what a test finds waiting on it
+    // afterwards is only what that test caused.
+    let listing = server.request.try_recv().expect("the listing");
+    assert!(listing.starts_with("GET /api/marks "), "{listing}");
+
+    (app, ctx, server)
+}
+
+/// Where a piece of the window's text is drawn, exactly as it is written.
+///
+/// For the buttons whose label is also the first word of the question above them, where looking for
+/// the start of a line would find the question.
+fn exact_text_pos(app: &mut MarksApp, ctx: &egui::Context, wanted: &str) -> egui::Pos2 {
+    drawn_text(app, ctx)
+        .into_iter()
+        .find(|(_, _, drawn)| drawn == wanted)
+        .map(|(pos, _, _)| pos)
+        .unwrap_or_else(|| panic!("no {wanted:?} drawn"))
+}
+
+#[test]
+fn the_arrow_keys_move_the_selection() {
+    let settings = Settings::new("arrows");
+    let (mut app, ctx, _server) = two_marked_marks(&settings, Vec::new());
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    assert_eq!(app.selected, 1, "Down did not move the selection");
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowUp, egui::Modifiers::NONE)],
+    );
+    assert_eq!(app.selected, 0, "Up did not move the selection");
+
+    // And after a press in the list, which is what puts the caret somewhere: the keys are the
+    // window's, and nothing a row draws is what they reach for.
+    let row = text_pos(&mut app, &ctx, "Beta");
+    click(&mut app, &ctx, row);
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowUp, egui::Modifiers::NONE)],
+    );
+    assert_eq!(
+        app.selected, 0,
+        "Up did not move the selection after a press on a row"
+    );
+}
+
+#[test]
+fn ctrl_e_changes_the_mark_that_is_selected() {
+    let settings = Settings::new("ctrl-e");
+    let (mut app, ctx, _server) = two_marked_marks(&settings, Vec::new());
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::E, egui::Modifiers::CTRL)],
+    );
+
+    let edit = app.edit.as_ref().expect("the edit dialog");
+    assert_eq!(
+        edit.mark_id, "mark-2",
+        "the dialog is not about the selected mark"
+    );
+    assert_eq!(edit.name, "Beta");
+
+    // On screen, with what the mark already holds in the fields.
+    assert!(drew(&mut app, &ctx, "Change this mark"));
+    assert!(drew(&mut app, &ctx, "Beta"));
+}
+
+#[test]
+fn a_change_is_sent_as_a_patch_and_the_row_carries_what_came_back() {
+    let settings = Settings::new("edit-save");
+    let (mut app, ctx, server) = two_marked_marks(
+        &settings,
+        vec![changed_to("mark-2", "Renamed", "https://beta.example/")],
+    );
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::E, egui::Modifiers::CTRL)],
+    );
+
+    app.edit.as_mut().expect("the edit dialog").name = "Renamed".to_owned();
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+
+    assert!(
+        wait_until(&mut app, &ctx, |app| app.edit.is_none()),
+        "the change never came back, so the dialog stayed up"
+    );
+    assert_eq!(app.marks[1].name, "Renamed");
+    assert_eq!(app.marks[1].content, "https://beta.example/");
+    assert!(drew(&mut app, &ctx, "Renamed"), "the row kept the old name");
+
+    // The change, and the only request after the listing: a PATCH to the mark the dialog was about,
+    // and not to the other one.
+    let change = server.request.try_recv().expect("the change");
+    assert!(change.starts_with("PATCH /api/marks/mark-2 "), "{change}");
+}
+
+#[test]
+fn a_change_that_is_refused_keeps_the_dialog_and_what_was_typed_into_it() {
+    let settings = Settings::new("edit-refused");
+    let (mut app, ctx, _server) = two_marked_marks(
+        &settings,
+        vec![(
+            "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n".to_owned(),
+            r#"{"error":"Name is required"}"#.to_owned(),
+        )],
+    );
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::E, egui::Modifiers::CTRL)],
+    );
+
+    app.edit.as_mut().expect("the edit dialog").name = "Renamed".to_owned();
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+
+    assert!(
+        wait_until(&mut app, &ctx, |app| app
+            .edit
+            .as_ref()
+            .is_some_and(|edit| edit.error.is_some())),
+        "the refusal was never reported"
+    );
+
+    let edit = app.edit.as_ref().expect("the edit dialog");
+    assert_eq!(edit.error.as_deref(), Some("Name is required"));
+    assert!(!edit.busy, "the dialog was left disabled");
+    assert_eq!(edit.name, "Renamed", "the dialog lost what was typed in it");
+}
+
+#[test]
+fn a_change_with_nothing_in_it_is_refused_here_rather_than_by_the_server() {
+    let settings = Settings::new("edit-empty");
+    let (mut app, ctx, server) = two_marked_marks(&settings, Vec::new());
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::E, egui::Modifiers::CTRL)],
+    );
+
+    app.edit.as_mut().expect("the edit dialog").name = "   ".to_owned();
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::Enter, egui::Modifiers::NONE)],
+    );
+
+    let edit = app.edit.as_ref().expect("the edit dialog");
+    assert_eq!(
+        edit.error.as_deref(),
+        Some("A mark needs a name and something in it.")
+    );
+    assert!(
+        server.request.try_recv().is_err(),
+        "the server was asked to store a mark with no name"
+    );
+}
+
+#[test]
+fn deleting_a_mark_asks_first_and_only_goes_through_when_told_to() {
+    let settings = Settings::new("delete-asks");
+    let (mut app, ctx, server) = two_marked_marks(&settings, vec![deletion_ok()]);
+
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::D, egui::Modifiers::CTRL)],
+    );
+
+    // The question is up, it names the mark, and nothing has been sent.
+    assert!(
+        drew(&mut app, &ctx, "Delete \"Beta\"?"),
+        "the deletion was not asked about"
+    );
+    assert!(
+        drew(&mut app, &ctx, "The mark goes for good"),
+        "the question does not say what it costs"
+    );
+    assert!(
+        server.request.try_recv().is_err(),
+        "a mark was deleted without being asked about"
+    );
+
+    // Answered with no: the mark stays, and nothing is sent.
+    let cancel = exact_text_pos(&mut app, &ctx, "Cancel");
+    click(&mut app, &ctx, cancel);
+
+    assert!(app.confirmation.is_none(), "the question stayed up");
+    assert_eq!(app.marks.len(), 2, "a mark went on a no");
+    assert!(
+        server.request.try_recv().is_err(),
+        "a no sent a deletion anyway"
+    );
+
+    // Asked again, and answered with yes: now it goes, and the request goes with it.
+    frame(
+        &mut app,
+        &ctx,
+        vec![press(egui::Key::D, egui::Modifiers::CTRL)],
+    );
+
+    let delete = exact_text_pos(&mut app, &ctx, "Delete");
+    click(&mut app, &ctx, delete);
+
+    assert!(
+        wait_until(&mut app, &ctx, |app| app.marks.len() == 1),
+        "the mark was not deleted after being told to"
+    );
+    assert_eq!(app.marks[0].name, "Alpha");
+
+    let deletion = server.request.try_recv().expect("the deletion");
+    assert!(deletion.starts_with("DELETE /api/marks/mark-2 "), "{deletion}");
+}
+
 

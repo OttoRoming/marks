@@ -7,8 +7,8 @@
 //! late answer rather than a frozen window.
 //!
 //! The keyboard is the interface, a launcher having one field and no buttons to hunt for:
-//! Ctrl+Enter saves what is typed, Enter opens the selected mark, Ctrl+D deletes it, Ctrl+, opens
-//! the settings panel, and Escape closes whatever is in front of the list.
+//! Ctrl+Enter saves what is typed, Enter opens the selected mark, Ctrl+E changes it, Ctrl+D asks to
+//! delete it, Ctrl+, opens the settings panel, and Escape closes whatever is in front of the list.
 
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -59,6 +59,9 @@ pub enum Event {
     SessionLost,
     Created(Mark),
     CreateFailed(String),
+    /// A mark was changed, and this is it as the server now stores it.
+    Updated(Mark),
+    UpdateFailed(String),
     Deleted { mark_id: String, name: String },
     DeleteFailed(String),
     Icon {
@@ -94,6 +97,51 @@ struct AuthForm {
     focus_first_field: bool,
 }
 
+/// The mark being edited, and what is typed into the dialog about it.
+///
+/// A copy of the mark rather than a reference to it: the list is being read while this is typed at,
+/// and a mark that changed under the fields would be a dialog arguing with itself.
+struct EditForm {
+    /// What is being changed, and what the change is sent to.
+    mark_id: String,
+    name: String,
+    content: String,
+    /// True while the change is in flight, which disables the form.
+    busy: bool,
+    error: Option<String>,
+    /// Set when the name field should take the caret on the next frame, which is when the dialog
+    /// has just been opened.
+    focus_name: bool,
+}
+
+/// What the edit dialog was asked to do, once the frame it was drawn in is over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditRequest {
+    Save,
+    Cancel,
+}
+
+/// Something the window will do, once the user has said to.
+///
+/// One variant so far — deleting a mark — and the shape is what makes the confirmation reusable:
+/// the dialog asks the question and the window carries out whatever was asked about, so a second
+/// kind of action that cannot be taken back needs a variant here and nowhere else.
+enum Pending {
+    Delete { mark_id: String, name: String },
+}
+
+/// A question the window is asking before doing something it cannot take back.
+struct Confirmation {
+    question: String,
+    /// What goes with the question: what the action costs, for a question about something that
+    /// cannot be taken back.
+    note: String,
+    /// What the button that goes through with it says, so that the button is the answer rather than
+    /// a bare "yes".
+    confirm: String,
+    action: Pending,
+}
+
 /// The last thing worth telling the user, shown above the key hints.
 struct Notice {
     text: String,
@@ -119,6 +167,8 @@ impl Notice {
 /// The launcher shortcuts, read from one frame's input in one go.
 struct Keys {
     save: bool,
+    /// Ctrl+E: change the mark that is selected.
+    edit: bool,
     open: bool,
     up: bool,
     down: bool,
@@ -164,6 +214,10 @@ pub struct MarksApp {
     window_settings_changed: bool,
 
     auth: AuthForm,
+    /// The mark being changed, while a dialog is open for it.
+    edit: Option<EditForm>,
+    /// The question the window is asking before doing something it cannot take back.
+    confirmation: Option<Confirmation>,
     notice: Option<Notice>,
 }
 
@@ -231,6 +285,8 @@ impl MarksApp {
                 ..Default::default()
             },
             notice: None,
+            edit: None,
+            confirmation: None,
         };
 
         // A setting that names a font this machine has cannot be honoured until the machine's
@@ -298,18 +354,22 @@ impl MarksApp {
                     self.notice = Some(Notice::info(format!("Saved \"{}\".", mark.name)));
                     // The search box did its job; clearing it shows the new mark in place.
                     self.query.clear();
-
-                    let new_id = mark.id.clone();
-                    self.marks.push(mark);
-                    // The server orders marks by name, so the list is re-ordered here rather
-                    // than reloaded to find out where the new one belongs.
-                    self.marks.sort_by(|left, right| {
-                        left.name.to_lowercase().cmp(&right.name.to_lowercase())
-                    });
-                    self.selected = filter_marks(&self.marks, &self.query)
-                        .iter()
-                        .position(|candidate| candidate.id == new_id)
-                        .unwrap_or(0);
+                    self.settle_mark(mark);
+                }
+                Event::Updated(mark) => {
+                    self.notice = Some(Notice::info(format!("Saved \"{}\".", mark.name)));
+                    // The dialog has done its job and the change has landed: it comes down, and the
+                    // row it was opened from carries what was typed into it.
+                    self.edit = None;
+                    self.settle_mark(mark);
+                }
+                Event::UpdateFailed(message) => {
+                    // The dialog stays up with what was typed still in it: a change that was refused
+                    // is worth another try, and there is no reason to make the user type it again.
+                    if let Some(edit) = &mut self.edit {
+                        edit.busy = false;
+                        edit.error = Some(message);
+                    }
                 }
                 Event::CreateFailed(message) => self.notice = Some(Notice::error(message)),
                 Event::Deleted { mark_id, name } => {
@@ -521,23 +581,110 @@ impl MarksApp {
         }
     }
 
-    /// Deletes the selected mark (Ctrl+D).
-    fn delete_selected(&mut self, ctx: &egui::Context) {
-        let Some(api) = self.api.clone() else {
-            return;
-        };
+    /// Asks before deleting the selected mark (Ctrl+D).
+    ///
+    /// Nothing is deleted here, and nothing is sent: this is the one thing the window does that
+    /// cannot be taken back, so it is asked about first — in the same dialog, whether the ask came
+    /// from the keyboard or from anywhere else that may grow one.
+    fn ask_to_delete(&mut self) {
         let Some(mark) = selected_mark(&self.marks, &self.query, self.selected) else {
             return;
         };
 
-        let mark_id = mark.id.clone();
-        let name = mark.name.clone();
+        self.confirmation = Some(Confirmation {
+            question: format!("Delete \"{}\"?", mark.name),
+            note: "The mark goes for good, and the favicon kept for it goes with it.".to_owned(),
+            confirm: "Delete".to_owned(),
+            action: Pending::Delete {
+                mark_id: mark.id.clone(),
+                name: mark.name.clone(),
+            },
+        });
+    }
+
+    /// Deletes a mark, once the user has said to.
+    fn delete_mark(&mut self, ctx: &egui::Context, mark_id: String, name: String) {
+        let Some(api) = self.api.clone() else {
+            return;
+        };
 
         self.spawn(ctx, move || match api.delete_mark(&mark_id) {
             Ok(()) => Event::Deleted { mark_id, name },
             Err(ApiError::Unauthorized) => Event::SessionLost,
             Err(error) => Event::DeleteFailed(error.to_string()),
         });
+    }
+
+    /// Opens the edit dialog on the selected mark (Ctrl+E).
+    ///
+    /// What goes into the dialog is a copy of the mark rather than a place in the list: the list is
+    /// being read while the dialog is typed at, and the mark can move in it — a rename re-orders it
+    /// — so the dialog cannot be holding anything that moves.
+    fn edit_selected(&mut self) {
+        let Some(mark) = selected_mark(&self.marks, &self.query, self.selected) else {
+            return;
+        };
+
+        let (mark_id, name, content) = (mark.id.clone(), mark.name.clone(), mark.content.clone());
+
+        self.edit = Some(EditForm {
+            mark_id,
+            name,
+            content,
+            busy: false,
+            error: None,
+            focus_name: true,
+        });
+    }
+
+    /// Sends the change that was typed into the edit dialog.
+    fn save_edit(&mut self, ctx: &egui::Context) {
+        let Some(edit) = self.edit.as_mut() else {
+            return;
+        };
+
+        // The name is cut here rather than being refused after a round trip, and by the same rule
+        // the search box's names are (see `MAX_NAME_CHARS`).
+        let name: String = edit.name.trim().chars().take(MAX_NAME_CHARS).collect();
+        let content = edit.content.trim().to_owned();
+
+        if name.is_empty() || content.is_empty() {
+            edit.error = Some("A mark needs a name and something in it.".to_owned());
+            return;
+        }
+
+        let mark_id = edit.mark_id.clone();
+        edit.busy = true;
+        edit.error = None;
+
+        let Some(api) = self.api.clone() else {
+            return;
+        };
+
+        self.spawn(ctx, move || match api.update_mark(&mark_id, &name, &content) {
+            Ok(mark) => Event::Updated(mark),
+            Err(ApiError::Unauthorized) => Event::SessionLost,
+            Err(error) => Event::UpdateFailed(error.to_string()),
+        });
+    }
+
+    /// Puts a mark the server has just answered with where it belongs in the list, and selects it.
+    ///
+    /// The server orders marks by name, so a renamed one moves: the list is re-ordered here rather
+    /// than reloaded to find out where it went.
+    fn settle_mark(&mut self, mark: Mark) {
+        let mark_id = mark.id.clone();
+
+        match self.marks.iter_mut().find(|held| held.id == mark_id) {
+            Some(held) => *held = mark,
+            None => self.marks.push(mark),
+        }
+
+        self.marks.sort_by_key(|mark| mark.name.to_lowercase());
+        self.selected = filter_marks(&self.marks, &self.query)
+            .iter()
+            .position(|candidate| candidate.id == mark_id)
+            .unwrap_or(0);
     }
 
     /// Handles the launcher keys, consuming them so that no widget sees them first.
@@ -552,6 +699,8 @@ impl MarksApp {
             // Ctrl+D rather than Delete: the search field has the keyboard, and there Delete
             // and Backspace belong to the text being edited.
             remove: input.consume_key(egui::Modifiers::CTRL, egui::Key::D),
+            // Ctrl+E changes the selected mark, the same way Enter opens it.
+            edit: input.consume_key(egui::Modifiers::CTRL, egui::Key::E),
             // Ctrl+, is what every program puts its settings behind.
             config: input.consume_key(egui::Modifiers::CTRL, egui::Key::Comma),
             close: input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
@@ -572,7 +721,10 @@ impl MarksApp {
             self.move_selection(1);
         }
         if keys.remove {
-            self.delete_selected(ctx);
+            self.ask_to_delete();
+        }
+        if keys.edit {
+            self.edit_selected();
         }
         if keys.save {
             self.save_query(ctx);
@@ -684,6 +836,108 @@ impl MarksApp {
         });
 
         request
+    }
+
+    /// The dialog a mark is changed in: its name, its content, and the two ways out.
+    ///
+    /// Enter saves and Escape leaves it alone, both read before the form is drawn so that Enter
+    /// reaches this rather than going nowhere in a single-line field.
+    fn edit_modal(&mut self, ctx: &egui::Context) -> Option<EditRequest> {
+        let edit = self.edit.as_mut()?;
+        let mut request = None;
+
+        let (enter, escape) = ctx.input_mut(|input| {
+            (
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                input.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+            )
+        });
+
+        if escape {
+            request = Some(EditRequest::Cancel);
+        } else if enter && !edit.busy {
+            request = Some(EditRequest::Save);
+        }
+
+        egui::Modal::new(egui::Id::new("edit-mark")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading("Change this mark");
+
+            ui.add_space(8.0);
+            ui.label("Name");
+            let name = ui.add_enabled(
+                !edit.busy,
+                egui::TextEdit::singleline(&mut edit.name).desired_width(f32::INFINITY),
+            );
+
+            ui.add_space(4.0);
+            ui.label("Content");
+            ui.add_enabled(
+                !edit.busy,
+                egui::TextEdit::singleline(&mut edit.content).desired_width(f32::INFINITY),
+            );
+
+            if let Some(error) = &edit.error {
+                ui.add_space(6.0);
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+
+            ui.add_space(10.0);
+            ui.add_enabled_ui(!edit.busy, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        request = Some(EditRequest::Save);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        request = Some(EditRequest::Cancel);
+                    }
+                });
+            });
+
+            // The name is what the list shows and what the user came here to change as often as the
+            // content, so the caret starts there — and there is only the one field it can start in.
+            if edit.focus_name {
+                name.request_focus();
+                edit.focus_name = false;
+            }
+        });
+
+        request
+    }
+
+    /// The question the window asks before doing something it cannot take back.
+    ///
+    /// Escape answers it with no, and no key answers it with yes: the buttons are the only way
+    /// through, because what is being asked about is the one thing this window cannot undo.
+    fn confirm_modal(&mut self, ctx: &egui::Context) -> Option<bool> {
+        let confirmation = self.confirmation.as_ref()?;
+        let mut answer = None;
+
+        let escape =
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+
+        if escape {
+            answer = Some(false);
+        }
+
+        egui::Modal::new(egui::Id::new("confirmation")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.heading(&confirmation.question);
+            ui.add_space(6.0);
+            ui.weak(&confirmation.note);
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(&confirmation.confirm).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+
+        answer
     }
 
     /// The strip above the search field, which is what moves the window.
@@ -813,6 +1067,9 @@ impl MarksApp {
             ui.weak(hints(&[
                 "↑↓ move",
                 "Enter open",
+                "Ctrl+E change",
+                // "delete" rather than "ask to delete": the hint names the key that starts the
+                // thing, and what happens next is the dialog's business.
                 "Ctrl+D delete",
                 "Ctrl+, settings",
                 "Esc close",
@@ -1251,15 +1508,15 @@ impl MarksApp {
 
         self.drain_events(&ctx);
 
-        // While the sign-in dialog is up there is no list to drive, so the launcher keys are
-        // left alone: Enter belongs to the form. The configuration panel is the same, and takes
-        // the keyboard while it is up.
+        // While a dialog is up there is no list to drive, so the launcher keys are left alone: Enter
+        // belongs to the form or to the question. The configuration panel is the same, and each
+        // dialog reads the keys that are its own.
         let mut sign_in = None;
         if self.api.is_none() {
             sign_in = self.modal_keys(&ctx);
         } else if self.config_open {
             self.config_keys(&ctx);
-        } else {
+        } else if self.edit.is_none() && self.confirmation.is_none() {
             self.launcher_keys(&ctx);
         }
 
@@ -1284,6 +1541,27 @@ impl MarksApp {
             }
         } else if self.config_open {
             self.config_panel(&ctx, ui.max_rect());
+        }
+
+        // The dialogs ask, and the window acts on the answers here: neither of them changes anything
+        // itself, so that what is asked and what is done about it are written in one place.
+        if let Some(request) = self.edit_modal(&ctx) {
+            match request {
+                EditRequest::Save => self.save_edit(&ctx),
+                EditRequest::Cancel => self.edit = None,
+            }
+        }
+
+        if let Some(confirmed) = self.confirm_modal(&ctx) {
+            match self.confirmation.take() {
+                Some(Confirmation {
+                    action: Pending::Delete { mark_id, name },
+                    ..
+                }) if confirmed => self.delete_mark(&ctx, mark_id, name),
+                // Answered with "no", or gone for some other reason: the answer to a question about
+                // something that cannot be taken back is, by default, that nothing happens.
+                _ => {}
+            }
         }
     }
 }
