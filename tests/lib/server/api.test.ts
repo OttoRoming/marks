@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { badRequest, conflict, notFound, requireUser, unauthorized } from '$lib/server/api';
+import {
+	badRequest,
+	conflict,
+	isAdmin,
+	notFound,
+	requireAdmin,
+	requireUser,
+	unauthorized
+} from '$lib/server/api';
 import type { SessionUser } from '$lib/server/session';
 
 const user: SessionUser = { id: 'user-1', username: 'otto', is_admin: false };
@@ -88,5 +96,47 @@ describe('error responses', () => {
 		for (const response of [badRequest('x'), unauthorized(), notFound('x'), conflict('x')]) {
 			expect(response.headers.get('content-type')).toContain('application/json');
 		}
+	});
+});
+
+describe('requireAdmin', () => {
+	const admin: SessionUser = { id: 'user-2', username: 'root', is_admin: true };
+
+	it('hands back the user when they are an admin', () => {
+		const result = requireAdmin({ user: admin });
+
+		expect(result.success).toBe(true);
+		if (result.success) {
+			expect(result.user).toBe(admin);
+		}
+	});
+
+	it('answers 401 for a request with no session, like every other authenticated route', async () => {
+		const result = requireAdmin({ user: null });
+
+		expect(result.success).toBe(false);
+		if (!result.success) {
+			expect(result.response.status).toBe(401);
+			expect(await result.response.json()).toEqual({ error: 'Unauthorized' });
+		}
+	});
+
+	it('answers 404, not 403, to an account that is not an admin', async () => {
+		// The admin pages are not something such a user is being kept out of; they are something
+		// that is not there for them — which is also what a page that never existed answers, and
+		// what someone poking at urls should be told either way.
+		const result = requireAdmin({ user });
+
+		expect(result.success).toBe(false);
+		if (!result.success) {
+			expect(result.response.status).toBe(404);
+			expect(await result.response.json()).toEqual({ error: 'Not found' });
+		}
+	});
+
+	it('agrees with isAdmin about who may administer', () => {
+		expect(isAdmin(admin)).toBe(true);
+		expect(isAdmin(user)).toBe(false);
+		expect(isAdmin(null)).toBe(false);
 	});
 });

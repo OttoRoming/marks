@@ -79,3 +79,44 @@ export function requireUser(locals: { user: SessionUser | null }): RequireUserRe
 
 	return { success: true, user };
 }
+
+/**
+ * Whether this account may use the admin pages and the admin API.
+ *
+ * One place decides that, so the pages (see `src/routes/admin/+layout.server.ts`) and the routes
+ * cannot come to different conclusions about the same account.
+ */
+export function isAdmin(user: SessionUser | null): boolean {
+	return user?.is_admin === true;
+}
+
+export type RequireAdminResult = RequireUserResult;
+
+/**
+ * The signed-in user, when they are an admin — or the response to answer with, shaped like
+ * [`requireUser`] so an admin route opens the way every other route does:
+ *
+ * ```ts
+ * const auth = requireAdmin(locals);
+ * if (!auth.success) {
+ * 	return auth.response;
+ * }
+ * ```
+ *
+ * An account that is not an admin is answered with **404**, not 403: the admin pages are not
+ * something such a user is being kept out of, they are something that is not there for them — the
+ * same reason `getOwnMark` reports someone else's mark as missing rather than as forbidden. A page
+ * that was renamed, or never existed, then answers identically.
+ */
+export function requireAdmin(locals: { user: SessionUser | null }): RequireAdminResult {
+	const auth = requireUser(locals);
+	if (!auth.success) {
+		return auth;
+	}
+
+	if (!isAdmin(auth.user)) {
+		return { success: false, response: notFound('Not found') };
+	}
+
+	return auth;
+}
